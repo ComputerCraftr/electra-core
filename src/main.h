@@ -104,6 +104,10 @@ static const unsigned int BLOCK_DOWNLOAD_WINDOW = 1024;
 static const unsigned int DATABASE_WRITE_INTERVAL = 3600;
 /** Maximum length of reject messages. */
 static const unsigned int MAX_REJECT_MESSAGE_LENGTH = 111;
+/** Maximum number of headers to announce when relaying blocks with headers message.*/
+static const unsigned int MAX_BLOCKS_TO_ANNOUNCE = 8;
+/** Maximum number of unconnecting headers announcements before DoS score */
+static const unsigned int MAX_UNCONNECTING_HEADERS = 10;
 
 /** Default for -headerspamfilter, use header spam filter */
 static const bool DEFAULT_HEADER_SPAM_FILTER = true;

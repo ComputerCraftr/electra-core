@@ -316,7 +316,11 @@ struct CNodeState {
     //! The hash of the last unknown block this peer has announced.
     uint256 hashLastUnknownBlock;
     //! The last full block we both have.
-    CBlockIndex* pindexLastCommonBlock;
+    CBlockIndex *pindexLastCommonBlock;
+    //! The best header we have sent our peer.
+    CBlockIndex *pindexBestHeaderSent;
+    //! Length of current-streak of unconnecting headers announcements
+    int nUnconnectingHeaders;
     //! Whether we've started headers synchronization with this peer.
     bool fSyncStarted;
     //! Since when we're stalling block download progress (in microseconds), or 0.
@@ -325,6 +329,8 @@ struct CNodeState {
     int nBlocksInFlight;
     //! Whether we consider this a preferred download peer.
     bool fPreferredDownload;
+    //! Whether this peer wants invs or headers (when possible) for block announcements.
+    bool fPreferHeaders;
 
     CNodeHeaders headers;
 
@@ -333,12 +339,15 @@ struct CNodeState {
         nMisbehavior = 0;
         fShouldBan = false;
         pindexBestKnownBlock = NULL;
-        hashLastUnknownBlock = uint256(0);
+        hashLastUnknownBlock.SetNull();
         pindexLastCommonBlock = NULL;
+        pindexBestHeaderSent = NULL;
+        nUnconnectingHeaders = 0;
         fSyncStarted = false;
         nStallingSince = 0;
         nBlocksInFlight = 0;
         fPreferredDownload = false;
+        fPreferHeaders = false;
     }
 };
 
@@ -463,6 +472,22 @@ void UpdateBlockAvailability(NodeId nodeid, const uint256 &hash) {
         // An unknown block was announced; just assume that the latest one is the best one.
         state->hashLastUnknownBlock = hash;
     }
+}
+
+// Requires cs_main
+bool CanDirectFetch()
+{
+    return chainActive.Tip()->GetBlockTime() > GetAdjustedTime() - Params().TargetSpacing() * 20;
+}
+
+// Requires cs_main
+bool PeerHasHeader(CNodeState *state, CBlockIndex *pindex)
+{
+    if (state->pindexBestKnownBlock && pindex == state->pindexBestKnownBlock->GetAncestor(pindex->nHeight))
+        return true;
+    if (state->pindexBestHeaderSent && pindex == state->pindexBestHeaderSent->GetAncestor(pindex->nHeight))
+        return true;
+    return false;
 }
 
 /** Find the last common ancestor two blocks have.
@@ -3607,11 +3632,12 @@ static bool ActivateBestChainStep(CValidationState& state, CBlockIndex* pindexMo
  */
 bool ActivateBestChain(CValidationState& state, CBlock* pblock, bool fAlreadyChecked)
 {
-    CBlockIndex* pindexNewTip = NULL;
     CBlockIndex* pindexMostWork = NULL;
     do {
         boost::this_thread::interruption_point();
 
+        CBlockIndex *pindexNewTip = NULL;
+        const CBlockIndex *pindexFork;
         bool fInitialDownload;
         while (true) {
             TRY_LOCK(cs_main, lockMain);
@@ -3620,6 +3646,7 @@ bool ActivateBestChain(CValidationState& state, CBlock* pblock, bool fAlreadyChe
                 continue;
             }
 
+            CBlockIndex *pindexOldTip = chainActive.Tip();
             pindexMostWork = FindMostWorkChain();
 
             // Whether we have anything to do at all.
@@ -3630,6 +3657,7 @@ bool ActivateBestChain(CValidationState& state, CBlock* pblock, bool fAlreadyChe
                 return false;
 
             pindexNewTip = chainActive.Tip();
+            pindexFork = chainActive.FindFork(pindexOldTip);
             fInitialDownload = IsInitialBlockDownload();
             break;
         }
@@ -3637,27 +3665,44 @@ bool ActivateBestChain(CValidationState& state, CBlock* pblock, bool fAlreadyChe
 
         // Notifications/callbacks that can run without cs_main
         if (!fInitialDownload) {
-            uint256 hashNewTip = pindexNewTip->GetBlockHash();
+            // Find the hashes of all blocks that weren't previously in the best chain.
+            std::vector<uint256> vHashes;
+            CBlockIndex *pindexToAnnounce = pindexNewTip;
+            while (pindexToAnnounce != pindexFork) {
+                vHashes.push_back(pindexToAnnounce->GetBlockHash());
+                pindexToAnnounce = pindexToAnnounce->pprev;
+                if (vHashes.size() == MAX_BLOCKS_TO_ANNOUNCE) {
+                    // Limit announcements in case of a huge reorganization.
+                    // Rely on the peer's synchronization mechanism in that case.
+                    break;
+                }
+            }
             // Relay inventory, but don't relay old inventory during initial block download.
             int nBlockEstimate = Checkpoints::GetTotalBlocksEstimate();
             {
                 LOCK(cs_vNodes);
-                BOOST_FOREACH (CNode* pnode, vNodes)
-                    if (chainActive.Height() > (pnode->nStartingHeight != -1 ? pnode->nStartingHeight - 2000 : nBlockEstimate))
-                        pnode->PushInventory(CInv(MSG_BLOCK, hashNewTip));
+                BOOST_FOREACH(CNode* pnode, vNodes) {
+                    if (chainActive.Height() > (pnode->nStartingHeight != -1 ? pnode->nStartingHeight - 2000 : nBlockEstimate)) {
+                        BOOST_REVERSE_FOREACH(const uint256& hash, vHashes) {
+                            pnode->PushBlockHash(hash);
+                        }
+                    }
+                }
             }
             // Notify external listeners about the new tip.
             // Note: uiInterface, should switch main signals.
-            uiInterface.NotifyBlockTip(hashNewTip);
-            GetMainSignals().UpdatedBlockTip(pindexNewTip);
-
-            unsigned size = 0;
-            if (pblock)
-                size = GetSerializeSize(*pblock, SER_NETWORK, PROTOCOL_VERSION);
-            // If the size is over 1 MB notify external listeners, and it is within the last 5 minutes
-            if (size > MAX_BLOCK_SIZE_LEGACY && pblock->GetBlockTime() > GetAdjustedTime() - 300) {
-                uiInterface.NotifyBlockSize(static_cast<int>(size), hashNewTip);
+            if (!vHashes.empty()) {
+                GetMainSignals().UpdatedBlockTip(pindexNewTip);
+                uiInterface.NotifyBlockTip(vHashes.front());
             }
+
+            //unsigned size = 0;
+            //if (pblock)
+                //size = GetSerializeSize(*pblock, SER_NETWORK, PROTOCOL_VERSION);
+            // If the size is over 1 MB notify external listeners, and it is within the last 5 minutes
+            //if (size > MAX_BLOCK_SIZE_LEGACY && pblock->GetBlockTime() > GetAdjustedTime() - 300) {
+                //uiInterface.NotifyBlockSize(static_cast<int>(size), hashNewTip);
+            //}
         }
     } while (pindexMostWork != chainActive.Tip());
     CheckBlockIndex();
@@ -4682,20 +4727,20 @@ bool ProcessNewBlock(CValidationState& state, CNode* pfrom, CBlock* pblock, CDis
     {
         LOCK(cs_main);   // Replaces the former TRY_LOCK loop because busy waiting wastes too much resources
 
-        MarkBlockAsReceived (pblock->GetHash ());
+        MarkBlockAsReceived(pblock->GetHash());
         if (!checked) {
-            return error ("%s : CheckBlock FAILED for block %s", __func__, pblock->GetHash().GetHex());
+            return error("%s : CheckBlock FAILED for block %s", __func__, pblock->GetHash().GetHex());
         }
 
         // Store to disk
         CBlockIndex* pindex = NULL;
-        bool ret = AcceptBlock (*pblock, state, &pindex, dbp, checked);
+        bool ret = AcceptBlock(*pblock, state, &pindex, dbp, checked);
         if (pindex && pfrom) {
-            mapBlockSource[pindex->GetBlockHash ()] = pfrom->GetId ();
+            mapBlockSource[pindex->GetBlockHash()] = pfrom->GetId();
         }
-        CheckBlockIndex ();
+        CheckBlockIndex();
         if (!ret)
-            return error ("%s : AcceptBlock FAILED", __func__);
+            return error("%s : AcceptBlock FAILED", __func__);
     }
 
     if (!ActivateBestChain(state, pblock, checked))
@@ -5722,10 +5767,10 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             return false;
 
         // Instantly ban old peers once we are at the upgrade block
-        if (pfrom->nVersion < 70915 && (chainActive.Height() + 1 >= Params().WALLET_UPGRADE_BLOCK() || Params().NetworkID() != CBaseChainParams::MAIN)) {
+        if (pfrom->nVersion < MIN_PEER_PROTO_VERSION_AFTER_WALLET_UPGRADE && (chainActive.Height() + 1 >= Params().WALLET_UPGRADE_BLOCK() || Params().NetworkID() != CBaseChainParams::MAIN)) {
             LogPrintf("peer=%d using obsolete version %i; disconnecting\n", pfrom->id, pfrom->nVersion);
             pfrom->PushMessage("reject", strCommand, REJECT_OBSOLETE,
-                               strprintf("Version must be %d or greater", 70915 /*MIN_PEER_PROTO_VERSION*/));
+                               strprintf("Version must be %d or greater", MIN_PEER_PROTO_VERSION_AFTER_WALLET_UPGRADE));
             pfrom->fDisconnect = true;
             return false;
         }
@@ -5834,6 +5879,14 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             LOCK(cs_main);
             State(pfrom->GetId())->fCurrentlyConnected = true;
         }
+
+        if (pfrom->nVersion >= SENDHEADERS_VERSION) {
+            // Tell our peer we prefer to receive headers rather than inv's
+            // We send this to non-NODE NETWORK peers as well, because even
+            // non-NODE NETWORK peers can announce blocks (such as pruning
+            // nodes)
+            pfrom->PushMessage("sendheaders");
+        }
     }
 
 
@@ -5899,6 +5952,12 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             pfrom->fDisconnect = true;
     }
 
+    else if (strCommand == "sendheaders")
+    {
+        LOCK(cs_main);
+        State(pfrom->GetId())->fPreferHeaders = true;
+    }
+
 
     else if (strCommand == "inv") {
         vector<CInv> vInv;
@@ -5928,7 +5987,13 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             if (inv.type == MSG_BLOCK) {
                 UpdateBlockAvailability(pfrom->GetId(), inv.hash);
                 if (!fAlreadyHave && !fImporting && !fReindex && !mapBlocksInFlight.count(inv.hash)) {
-                    if (Params().HeadersFirstSyncingActive())
+                    if (!Params().HeadersFirstSyncingActive() || pfrom->nVersion < SENDHEADERS_VERSION)
+                    {
+                        // Add this to the list of blocks to request
+                        vToFetch.push_back(inv);
+                        LogPrint("net", "getblocks (%d) %s to peer=%d\n", pindexBestHeader->nHeight, inv.hash.ToString(), pfrom->id);
+                    }
+                    else
                     {
                         // First request the headers preceeding the announced block. In the normal fully-synced
                         // case where a new block is announced that succeeds the current tip (no reorganization),
@@ -5940,20 +6005,13 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                         // not a direct successor.
                         pfrom->PushMessage("getheaders", chainActive.GetLocator(pindexBestHeader), inv.hash);
                         CNodeState *nodestate = State(pfrom->GetId());
-                        if (chainActive.Tip()->GetBlockTime() > GetAdjustedTime() - Params().TargetSpacing() * 20 &&
-                            nodestate->nBlocksInFlight < MAX_BLOCKS_IN_TRANSIT_PER_PEER) {
+                        if (CanDirectFetch() && nodestate->nBlocksInFlight < MAX_BLOCKS_IN_TRANSIT_PER_PEER) {
                             vToFetch.push_back(inv);
                             // Mark block as in flight already, even though the actual "getdata" message only goes out
                             // later (within the same cs_main lock, though).
                             MarkBlockAsInFlight(pfrom->GetId(), inv.hash);
                         }
                         LogPrint("net", "getheaders (%d) %s to peer=%d\n", pindexBestHeader->nHeight, inv.hash.ToString(), pfrom->id);
-                    }
-                    else
-                    {
-                        // Add this to the list of blocks to request
-                        vToFetch.push_back(inv);
-                        LogPrint("net", "getblocks (%d) %s to peer=%d\n", pindexBestHeader->nHeight, inv.hash.ToString(), pfrom->id);
                     }
                 }
             }
@@ -6036,7 +6094,12 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         vRecv >> locator >> hashStop;
 
         LOCK(cs_main);
+        if (IsInitialBlockDownload() && !pfrom->fWhitelisted) {
+            LogPrint("net", "Ignoring getheaders from peer=%d because node is in initial block download\n", pfrom->id);
+            return true;
+        }
 
+        CNodeState *nodestate = State(pfrom->GetId());
         CBlockIndex* pindex = NULL;
         if (locator.IsNull())
         {
@@ -6064,6 +6127,11 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             if (--nLimit <= 0 || pindex->GetBlockHash() == hashStop)
                 break;
         }
+        // pindex can be NULL either if we sent chainActive.Tip() OR
+        // if our peer has chainActive.Tip() (and thus we are sending an empty
+        // headers message). In both cases it's safe to update
+        // pindexBestHeaderSent to be our tip.
+        nodestate->pindexBestHeaderSent = pindex ? pindex : chainActive.Tip();
         pfrom->PushMessage("headers", vHeaders);
     }
 
@@ -6246,7 +6314,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
 
     else if (strCommand == "headers" && Params().HeadersFirstSyncingActive() && !fImporting && !fReindex) // Ignore headers received while importing
     {
-        std::vector<CBlock> headers;
+        std::vector<CBlockHeader> headers;
 
         // Bypass the normal CBlock deserialization, as we don't want to risk deserializing 2000 full blocks.
         unsigned int nCount = ReadCompactSize(vRecv);
@@ -6261,10 +6329,37 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             ReadCompactSize(vRecv); // ignore tx count; assume it is 0.
         }
 
-        LOCK(cs_main);
-
         if (nCount == 0) {
             // Nothing interesting. Stop asking this peers for more headers.
+            return true;
+        }
+
+        LOCK(cs_main);
+        CNodeState *nodestate = State(pfrom->GetId());
+        // If this looks like it could be a block announcement (nCount <
+        // MAX_BLOCKS_TO_ANNOUNCE), use special logic for handling headers that
+        // don't connect:
+        // - Send a getheaders message in response to try to connect the chain.
+        // - The peer can send up to MAX_UNCONNECTING_HEADERS in a row that
+        //   don't connect before giving DoS points
+        // - Once a headers message is received that is valid and does connect,
+        //   nUnconnectingHeaders gets reset back to 0.
+        if (mapBlockIndex.find(headers[0].hashPrevBlock) == mapBlockIndex.end() && nCount < MAX_BLOCKS_TO_ANNOUNCE) {
+            nodestate->nUnconnectingHeaders++;
+            pfrom->PushMessage("getheaders", chainActive.GetLocator(pindexBestHeader), uint256(0));
+            LogPrint("net", "received header %s: missing prev block %s, sending getheaders (%d) to end (peer=%d, nUnconnectingHeaders=%d)\n",
+                    headers[0].GetHash().ToString(),
+                    headers[0].hashPrevBlock.ToString(),
+                    pindexBestHeader->nHeight,
+                    pfrom->id, nodestate->nUnconnectingHeaders);
+            // Set hashLastUnknownBlock for this peer, so that if we
+            // eventually get the headers - even from a different peer -
+            // we can use this peer to download.
+            UpdateBlockAvailability(pfrom->GetId(), headers.back().GetHash());
+
+            if (nodestate->nUnconnectingHeaders % MAX_UNCONNECTING_HEADERS == 0) {
+                Misbehaving(pfrom->GetId(), 20);
+            }
             return true;
         }
 
@@ -6276,8 +6371,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         int nLast = 0;
 
         CBlockIndex *pindexLast = NULL;
-
-        BOOST_FOREACH(const CBlock& header, headers) {
+        for (const CBlockHeader& header : headers) {
             CValidationState state;
             if (pindexLast != NULL && header.hashPrevBlock != pindexLast->GetBlockHash()) {
                 Misbehaving(pfrom->GetId(), 20);
@@ -6285,9 +6379,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                 strError = "non-continuous headers sequence";
                 break;
             }
-
-            CBlockHeader pblockheader = CBlockHeader(header);
-            if (!AcceptBlockHeader(pblockheader, state, &pindexLast)) {
+            if (!AcceptBlockHeader(header, state, &pindexLast)) {
                 int nDoS;
                 if (state.IsInvalid(nDoS)) {
                     if (nDoS > 0)
@@ -6326,15 +6418,70 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         if (!ret)
             return error(strError.c_str());
 
-        if (pindexLast)
+        {
+            LOCK(cs_main);
+            CNodeState *nodestate = State(pfrom->GetId());
+            if (nodestate->nUnconnectingHeaders > 0) {
+                LogPrint("net", "peer=%d: resetting nUnconnectingHeaders (%d -> 0)\n", pfrom->id, nodestate->nUnconnectingHeaders);
+            }
+            nodestate->nUnconnectingHeaders = 0;
+
+            assert(pindexLast);
             UpdateBlockAvailability(pfrom->GetId(), pindexLast->GetBlockHash());
 
-        if (nCount == MAX_HEADERS_RESULTS && pindexLast) {
-            // Headers message had its maximum size; the peer may have more headers.
-            // TODO: optimize: if pindexLast is an ancestor of chainActive.Tip or pindexBestHeader, continue
-            // from there instead.
-            LogPrint("net", "more getheaders (%d) to end to peer=%d (startheight:%d)\n", pindexLast->nHeight, pfrom->id, pfrom->nStartingHeight);
-            pfrom->PushMessage("getheaders", chainActive.GetLocator(pindexLast), uint256(0));
+            if (nCount == MAX_HEADERS_RESULTS) {
+                // Headers message had its maximum size; the peer may have more headers.
+                // TODO: optimize: if pindexLast is an ancestor of chainActive.Tip or pindexBestHeader, continue
+                // from there instead.
+                LogPrint("net", "more getheaders (%d) to end to peer=%d (startheight:%d)\n", pindexLast->nHeight, pfrom->id, pfrom->nStartingHeight);
+                pfrom->PushMessage("getheaders", chainActive.GetLocator(pindexLast), uint256(0));
+            }
+
+            bool fCanDirectFetch = CanDirectFetch();
+            // If this set of headers is valid and ends in a block with at least as
+            // much work as our tip, download as much as possible.
+            if (fCanDirectFetch && pindexLast->IsValid(BLOCK_VALID_TREE) && chainActive.Tip()->nChainWork <= pindexLast->nChainWork) {
+                vector<CBlockIndex *> vToFetch;
+                CBlockIndex *pindexWalk = pindexLast;
+                // Calculate all the blocks we'd need to switch to pindexLast, up to a limit.
+                while (pindexWalk && !chainActive.Contains(pindexWalk) && vToFetch.size() <= MAX_BLOCKS_IN_TRANSIT_PER_PEER) {
+                    if (!(pindexWalk->nStatus & BLOCK_HAVE_DATA) &&
+                            !mapBlocksInFlight.count(pindexWalk->GetBlockHash())) {
+                        // We don't have this block, and it's not yet in flight.
+                        vToFetch.push_back(pindexWalk);
+                    }
+                    pindexWalk = pindexWalk->pprev;
+                }
+                // If pindexWalk still isn't on our main chain, we're looking at a
+                // very large reorg at a time we think we're close to caught up to
+                // the main chain -- this shouldn't really happen.  Bail out on the
+                // direct fetch and rely on parallel download instead.
+                if (!chainActive.Contains(pindexWalk)) {
+                    LogPrint("net", "Large reorg, won't direct fetch to %s (%d)\n",
+                            pindexLast->GetBlockHash().ToString(),
+                            pindexLast->nHeight);
+                } else {
+                    vector<CInv> vGetData;
+                    // Download as much as possible, from earliest to latest.
+                    BOOST_REVERSE_FOREACH(CBlockIndex *pindex, vToFetch) {
+                        if (nodestate->nBlocksInFlight >= MAX_BLOCKS_IN_TRANSIT_PER_PEER) {
+                            // Can't download any more from this peer
+                            break;
+                        }
+                        vGetData.push_back(CInv(MSG_BLOCK, pindex->GetBlockHash()));
+                        MarkBlockAsInFlight(pfrom->GetId(), pindex->GetBlockHash(), pindex);
+                        LogPrint("net", "Requesting block %s from  peer=%d\n",
+                                pindex->GetBlockHash().ToString(), pfrom->id);
+                    }
+                    if (vGetData.size() > 1) {
+                        LogPrint("net", "Downloading blocks toward %s (%d) via headers direct fetch\n",
+                                pindexLast->GetBlockHash().ToString(), pindexLast->nHeight);
+                    }
+                    if (vGetData.size() > 0) {
+                        pfrom->PushMessage("getdata", vGetData);
+                    }
+                }
+            }
         }
 
         CheckBlockIndex();
@@ -6877,22 +7024,118 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
             if (nSyncStarted == 0 || pindexBestHeader->GetBlockTime() > GetAdjustedTime() - 6 * 60 * 60) { // NOTE: was "close to today" and 24h in Bitcoin
                 state.fSyncStarted = true;
                 nSyncStarted++;
-                if (Params().HeadersFirstSyncingActive())
+                if (!Params().HeadersFirstSyncingActive() || pto->nVersion < SENDHEADERS_VERSION)
+                {
+                    pto->PushMessage("getblocks", chainActive.GetLocator(chainActive.Tip()), uint256(0));
+                }
+                else
                 {
                     CBlockIndex *pindexStart = pindexBestHeader->pprev ? pindexBestHeader->pprev : pindexBestHeader;
                     LogPrint("net", "initial getheaders (%d) to peer=%d (startheight:%d)\n", pindexStart->nHeight, pto->id, pto->nStartingHeight);
                     pto->PushMessage("getheaders", chainActive.GetLocator(pindexStart), uint256(0));
                 }
-                else
-                    pto->PushMessage("getblocks", chainActive.GetLocator(chainActive.Tip()), uint256(0));
             }
         }
 
         // Resend wallet transactions that haven't gotten in a block yet
         // Except during reindex, importing and IBD, when old wallet
         // transactions become unconfirmed and spams other nodes.
-        if (!fReindex /*&& !fImporting && !IsInitialBlockDownload()*/) {
+        if (!fReindex && !fImporting && !IsInitialBlockDownload()) {
             GetMainSignals().Broadcast();
+        }
+
+        //
+        // Try sending block announcements via headers
+        //
+        {
+            // If we have less than MAX_BLOCKS_TO_ANNOUNCE in our
+            // list of block hashes we're relaying, and our peer wants
+            // headers announcements, then find the first header
+            // not yet known to our peer but would connect, and send.
+            // If no header would connect, or if we have too many
+            // blocks, or if the peer doesn't want headers, just
+            // add all to the inv queue.
+            LOCK(pto->cs_inventory);
+            vector<CBlock> vHeaders;
+            bool fRevertToInv = (!state.fPreferHeaders || pto->vBlockHashesToAnnounce.size() > MAX_BLOCKS_TO_ANNOUNCE);
+            CBlockIndex *pBestIndex = NULL; // last header queued for delivery
+            ProcessBlockAvailability(pto->id); // ensure pindexBestKnownBlock is up-to-date
+
+            if (!fRevertToInv) {
+                bool fFoundStartingHeader = false;
+                // Try to find first header that our peer doesn't have, and
+                // then send all headers past that one.  If we come across any
+                // headers that aren't on chainActive, give up.
+                BOOST_FOREACH(const uint256 &hash, pto->vBlockHashesToAnnounce) {
+                    BlockMap::iterator mi = mapBlockIndex.find(hash);
+                    assert(mi != mapBlockIndex.end());
+                    CBlockIndex *pindex = mi->second;
+                    if (chainActive[pindex->nHeight] != pindex) {
+                        // Bail out if we reorged away from this block
+                        fRevertToInv = true;
+                        break;
+                    }
+                    assert(pBestIndex == NULL || pindex->pprev == pBestIndex);
+                    pBestIndex = pindex;
+                    if (fFoundStartingHeader) {
+                        // add this to the headers message
+                        vHeaders.push_back(pindex->GetBlockHeader());
+                    } else if (PeerHasHeader(&state, pindex)) {
+                        continue; // keep looking for the first new block
+                    } else if (pindex->pprev == NULL || PeerHasHeader(&state, pindex->pprev)) {
+                        // Peer doesn't have this header but they do have the prior one.
+                        // Start sending headers.
+                        fFoundStartingHeader = true;
+                        vHeaders.push_back(pindex->GetBlockHeader());
+                    } else {
+                        // Peer doesn't have this header or the prior one -- nothing will
+                        // connect, so bail out.
+                        fRevertToInv = true;
+                        break;
+                    }
+                }
+            }
+            if (fRevertToInv) {
+                // If falling back to using an inv, just try to inv the tip.
+                // The last entry in vBlockHashesToAnnounce was our tip at some point
+                // in the past.
+                if (!pto->vBlockHashesToAnnounce.empty()) {
+                    const uint256 &hashToAnnounce = pto->vBlockHashesToAnnounce.back();
+                    BlockMap::iterator mi = mapBlockIndex.find(hashToAnnounce);
+                    assert(mi != mapBlockIndex.end());
+                    CBlockIndex *pindex = mi->second;
+
+                    // Warn if we're announcing a block that is not on the main chain.
+                    // This should be very rare and could be optimized out.
+                    // Just log for now.
+                    if (chainActive[pindex->nHeight] != pindex) {
+                        LogPrint("net", "Announcing block %s not on main chain (tip=%s)\n",
+                            hashToAnnounce.ToString(), chainActive.Tip()->GetBlockHash().ToString());
+                    }
+
+                    // If the peer announced this block to us, don't inv it back.
+                    // (Since block announcements may not be via inv's, we can't solely rely on
+                    // setInventoryKnown to track this.)
+                    if (!PeerHasHeader(&state, pindex)) {
+                        pto->PushInventory(CInv(MSG_BLOCK, hashToAnnounce));
+                        LogPrint("net", "%s: sending inv peer=%d hash=%s\n", __func__,
+                            pto->id, hashToAnnounce.ToString());
+                    }
+                }
+            } else if (!vHeaders.empty()) {
+                if (vHeaders.size() > 1) {
+                    LogPrint("net", "%s: %u headers, range (%s, %s), to peer=%d\n", __func__,
+                            vHeaders.size(),
+                            vHeaders.front().GetHash().ToString(),
+                            vHeaders.back().GetHash().ToString(), pto->id);
+                } else {
+                    LogPrint("net", "%s: sending header %s to peer=%d\n", __func__,
+                            vHeaders.front().GetHash().ToString(), pto->id);
+                }
+                pto->PushMessage("headers", vHeaders);
+                state.pindexBestHeaderSent = pBestIndex;
+            }
+            pto->vBlockHashesToAnnounce.clear();
         }
 
         //
