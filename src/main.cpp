@@ -5725,7 +5725,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         if (pfrom->nVersion < 70915 && (chainActive.Height() + 1 >= Params().WALLET_UPGRADE_BLOCK() || Params().NetworkID() != CBaseChainParams::MAIN)) {
             LogPrintf("peer=%d using obsolete version %i; disconnecting\n", pfrom->id, pfrom->nVersion);
             pfrom->PushMessage("reject", strCommand, REJECT_OBSOLETE,
-                               strprintf("Version must be %d or greater", MIN_PEER_PROTO_VERSION));
+                               strprintf("Version must be %d or greater", 70915 /*MIN_PEER_PROTO_VERSION*/));
             pfrom->fDisconnect = true;
             return false;
         }
@@ -5928,24 +5928,33 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             if (inv.type == MSG_BLOCK) {
                 UpdateBlockAvailability(pfrom->GetId(), inv.hash);
                 if (!fAlreadyHave && !fImporting && !fReindex && !mapBlocksInFlight.count(inv.hash)) {
-                    // First request the headers preceeding the announced block. In the normal fully-synced
-                    // case where a new block is announced that succeeds the current tip (no reorganization),
-                    // there are no such headers.
-                    // Secondly, and only when we are close to being synced, we request the announced block directly,
-                    // to avoid an extra round-trip. Note that we must *first* ask for the headers, so by the
-                    // time the block arrives, the header chain leading up to it is already validated. Not
-                    // doing this will result in the received block being rejected as an orphan in case it is
-                    // not a direct successor.
-                    pfrom->PushMessage("getheaders", chainActive.GetLocator(pindexBestHeader), inv.hash);
-                    CNodeState *nodestate = State(pfrom->GetId());
-                    if (chainActive.Tip()->GetBlockTime() > GetAdjustedTime() - Params().TargetSpacing() * 20 &&
-                        nodestate->nBlocksInFlight < MAX_BLOCKS_IN_TRANSIT_PER_PEER) {
-                        vToFetch.push_back(inv);
-                        // Mark block as in flight already, even though the actual "getdata" message only goes out
-                        // later (within the same cs_main lock, though).
-                        MarkBlockAsInFlight(pfrom->GetId(), inv.hash);
+                    if (Params().HeadersFirstSyncingActive())
+                    {
+                        // First request the headers preceeding the announced block. In the normal fully-synced
+                        // case where a new block is announced that succeeds the current tip (no reorganization),
+                        // there are no such headers.
+                        // Secondly, and only when we are close to being synced, we request the announced block directly,
+                        // to avoid an extra round-trip. Note that we must *first* ask for the headers, so by the
+                        // time the block arrives, the header chain leading up to it is already validated. Not
+                        // doing this will result in the received block being rejected as an orphan in case it is
+                        // not a direct successor.
+                        pfrom->PushMessage("getheaders", chainActive.GetLocator(pindexBestHeader), inv.hash);
+                        CNodeState *nodestate = State(pfrom->GetId());
+                        if (chainActive.Tip()->GetBlockTime() > GetAdjustedTime() - Params().TargetSpacing() * 20 &&
+                            nodestate->nBlocksInFlight < MAX_BLOCKS_IN_TRANSIT_PER_PEER) {
+                            vToFetch.push_back(inv);
+                            // Mark block as in flight already, even though the actual "getdata" message only goes out
+                            // later (within the same cs_main lock, though).
+                            MarkBlockAsInFlight(pfrom->GetId(), inv.hash);
+                        }
+                        LogPrint("net", "getheaders (%d) %s to peer=%d\n", pindexBestHeader->nHeight, inv.hash.ToString(), pfrom->id);
                     }
-                    LogPrint("net", "getheaders (%d) %s to peer=%d\n", pindexBestHeader->nHeight, inv.hash.ToString(), pfrom->id);
+                    else
+                    {
+                        // Add this to the list of blocks to request
+                        vToFetch.push_back(inv);
+                        LogPrint("net", "getblocks (%d) %s to peer=%d\n", pindexBestHeader->nHeight, inv.hash.ToString(), pfrom->id);
+                    }
                 }
             }
 
@@ -6179,7 +6188,8 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                 }
             }
 
-            BOOST_FOREACH (uint256 hash, vEraseQueue)EraseOrphanTx(hash);
+            BOOST_FOREACH (uint256 hash, vEraseQueue)
+                EraseOrphanTx(hash);
         } else if (tx.IsZerocoinSpend() && AcceptToMemoryPool(mempool, state, tx, true, &fMissingZerocoinInputs, false, ignoreFees)) {
             //Presstab: ZCoin has a bunch of code commented out here. Is this something that should have more going on?
             //Also there is nothing that handles fMissingZerocoinInputs. Does there need to be?
@@ -6375,8 +6385,8 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
 
     // This asymmetric behavior for inbound and outbound connections was introduced
     // to prevent a fingerprinting attack: an attacker can send specific fake addresses
-    // to users' AddrMan and later request them by sending getaddr messages. 
-    // Making users (which are behind NAT and can only make outgoing connections) ignore 
+    // to users' AddrMan and later request them by sending getaddr messages.
+    // Making users (which are behind NAT and can only make outgoing connections) ignore
     // getaddr message mitigates the attack.
     else if ((strCommand == "getaddr") && (pfrom->fInbound))
     {
@@ -6867,9 +6877,14 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
             if (nSyncStarted == 0 || pindexBestHeader->GetBlockTime() > GetAdjustedTime() - 6 * 60 * 60) { // NOTE: was "close to today" and 24h in Bitcoin
                 state.fSyncStarted = true;
                 nSyncStarted++;
-                CBlockIndex *pindexStart = pindexBestHeader->pprev ? pindexBestHeader->pprev : pindexBestHeader;
-                LogPrint("net", "initial getheaders (%d) to peer=%d (startheight:%d)\n", pindexStart->nHeight, pto->id, pto->nStartingHeight);
-                pto->PushMessage("getheaders", chainActive.GetLocator(pindexStart), uint256(0));
+                if (Params().HeadersFirstSyncingActive())
+                {
+                    CBlockIndex *pindexStart = pindexBestHeader->pprev ? pindexBestHeader->pprev : pindexBestHeader;
+                    LogPrint("net", "initial getheaders (%d) to peer=%d (startheight:%d)\n", pindexStart->nHeight, pto->id, pto->nStartingHeight);
+                    pto->PushMessage("getheaders", chainActive.GetLocator(pindexStart), uint256(0));
+                }
+                else
+                    pto->PushMessage("getblocks", chainActive.GetLocator(chainActive.Tip()), uint256(0));
             }
         }
 
