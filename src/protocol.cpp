@@ -55,7 +55,7 @@ CMessageHeader::CMessageHeader(const char* pszCommand, unsigned int nMessageSize
 
 std::string CMessageHeader::GetCommand() const
 {
-    return std::string(pchCommand, pchCommand + strnlen_int(pchCommand, COMMAND_SIZE));
+    return std::string(pchCommand, pchCommand + strnlen(pchCommand, COMMAND_SIZE));
 }
 
 bool CMessageHeader::IsValid() const
@@ -131,7 +131,7 @@ CInv::CInv(const std::string& strType, const uint256& hashIn)
         }
     }
     if (i == ARRAYLEN(ppszTypeName))
-        throw std::out_of_range(strprintf("CInv::CInv(string, uint256) : unknown type '%s'", strType));
+        LogPrint("net", "CInv::CInv(string, uint256) : unknown type '%s'", strType);
     hash = hashIn;
 }
 
@@ -151,8 +151,11 @@ bool CInv::IsMasterNodeType() const{
 
 const char* CInv::GetCommand() const
 {
-    if (!IsKnownType())
-        throw std::out_of_range(strprintf("CInv::GetCommand() : type=%d unknown type", type));
+    if (!IsKnownType()) {
+        LogPrint("net", "CInv::GetCommand() : type=%d unknown type", type);
+        return "UNKNOWN";
+    }
+
     return ppszTypeName[type];
 }
 
