@@ -302,7 +302,7 @@ public:
     int64_t nLastRecv;
     int64_t nTimeConnected;
     int64_t nTimeOffset;
-    const CAddress addr;
+    CAddress addr;
     std::string addrName;
     CService addrLocal;
     int nVersion;
