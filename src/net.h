@@ -107,8 +107,8 @@ enum {
     LOCAL_MAX
 };
 
-bool IsPeerAddrLocalGood(CNode* pnode);
-void AdvertizeLocal(CNode* pnode);
+bool IsPeerAddrLocalGood(CNode *pnode);
+void AdvertiseLocal(CNode *pnode);
 void SetLimited(enum Network net, bool fLimited = true);
 bool IsLimited(enum Network net);
 bool IsLimited(const CNetAddr& addr);
@@ -128,6 +128,8 @@ extern bool fListen;
 extern uint64_t nLocalServices;
 extern uint64_t nLocalHostNonce;
 extern CAddrMan addrman;
+
+/** Maximum number of connections to simultaneously allow (aka connection slots) */
 extern int nMaxConnections;
 
 extern std::vector<CNode*> vNodes;
@@ -276,7 +278,6 @@ public:
 
 typedef std::map<CSubNet, CBanEntry> banmap_t;
 
-
 /** Information about a peer */
 class CNode
 {
@@ -285,7 +286,7 @@ public:
     uint64_t nServices;
     SOCKET hSocket;
     CDataStream ssSend;
-    size_t nSendSize;   // total size of all vSendMsg entries
+    size_t nSendSize; // total size of all vSendMsg entries
     size_t nSendOffset; // offset inside the first vSendMsg already sent
     uint64_t nSendBytes;
     std::deque<CSerializeData> vSendMsg;
@@ -301,7 +302,7 @@ public:
     int64_t nLastRecv;
     int64_t nTimeConnected;
     int64_t nTimeOffset;
-    CAddress addr;
+    const CAddress addr;
     std::string addrName;
     CService addrLocal;
     int nVersion;
