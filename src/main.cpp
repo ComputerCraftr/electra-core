@@ -4076,13 +4076,13 @@ bool CheckBlockHeader(const CBlockHeader& block, CValidationState& state, bool f
     return true;
 }
 
-bool CheckBlock(const CBlock& block, CValidationState& state, bool fCheckPOW, bool fCheckMerkleRoot, bool fCheckSig)
+bool CheckBlock(const CBlock& block, CValidationState& state, bool fCheckPOW, bool fCheckMerkleRoot)
 {
     // These are checks that are independent of context.
 
     // Check that the header is valid (particularly PoW).  This is mostly
     // redundant with the call in AcceptBlockHeader.
-    if (!CheckBlockHeader(block, state, block.IsProofOfWork()))
+    if (!CheckBlockHeader(block, state, fCheckPOW))
         return state.DoS(100, error("CheckBlock() : CheckBlockHeader failed"),
             REJECT_INVALID, "bad-header", true);
 
@@ -4348,7 +4348,7 @@ bool AcceptBlockHeader(const CBlockHeader& block, CValidationState& state, CBloc
         if (ppindex)
             *ppindex = pindex;
         if (pindex->nStatus & BLOCK_FAILED_MASK)
-            return state.Invalid(error("%s : block %s is marked invalid", __func__, hash.ToString()), 0, "duplicate");
+            return state.Invalid(error("%s: block %s is marked invalid", __func__, hash.ToString()), 0, "duplicate");
         return true;
     }
 
@@ -4362,7 +4362,7 @@ bool AcceptBlockHeader(const CBlockHeader& block, CValidationState& state, CBloc
     if (hash != Params().HashGenesisBlock()) {
         BlockMap::iterator mi = mapBlockIndex.find(block.hashPrevBlock);
         if (mi == mapBlockIndex.end())
-            return state.DoS(0, error("%s : prev block %s not found", __func__, block.hashPrevBlock.ToString().c_str()), 0, "bad-prevblk");
+            return state.DoS(10, error("%s: prev block %s not found", __func__, block.hashPrevBlock.ToString().c_str()), 0, "bad-prevblk");
         pindexPrev = (*mi).second;
         if (pindexPrev->nStatus & BLOCK_FAILED_MASK) {
             //If this "invalid" block is an exact match from the checkpoints, then reconsider it
@@ -4754,10 +4754,9 @@ void CBlockIndex::BuildSkip()
         pskip = pprev->GetAncestor(GetSkipHeight(nHeight));
 }
 
-bool ProcessNewBlock(CValidationState& state, CNode* pfrom, CBlock* pblock, CDiskBlockPos* dbp)
+bool ProcessNewBlock(CValidationState &state, CNode* pfrom, CBlock* pblock, bool fForceProcessing, CDiskBlockPos *dbp)
 {
     // Preliminary checks
-    int64_t nStartTime = GetTimeMillis();
     bool checked = CheckBlock(*pblock, state);
 
     int nMints = 0;
@@ -4790,16 +4789,16 @@ bool ProcessNewBlock(CValidationState& state, CNode* pfrom, CBlock* pblock, CDis
     }
 
     {
-        LOCK(cs_main);   // Replaces the former TRY_LOCK loop because busy waiting wastes too much resources
-
-        MarkBlockAsReceived(pblock->GetHash());
+        LOCK(cs_main);
+        bool fRequested = MarkBlockAsReceived(pblock->GetHash());
+        fRequested |= fForceProcessing;
         if (!checked) {
             return error("%s : CheckBlock FAILED for block %s", __func__, pblock->GetHash().GetHex());
         }
 
         // Store to disk
-        CBlockIndex* pindex = NULL;
-        bool ret = AcceptBlock(*pblock, state, &pindex, dbp, checked);
+        CBlockIndex *pindex = NULL;
+        bool ret = AcceptBlock(*pblock, state, &pindex, fRequested, dbp);
         if (pindex && pfrom) {
             mapBlockSource[pindex->GetBlockHash()] = pfrom->GetId();
         }
@@ -4922,7 +4921,7 @@ boost::filesystem::path GetBlockPosFilename(const CDiskBlockPos& pos, const char
 
 CBlockIndex* InsertBlockIndex(uint256 hash)
 {
-    if (hash == 0)
+    if (hash.IsNull())
         return NULL;
 
     // Return existing
