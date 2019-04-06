@@ -202,8 +202,8 @@ namespace {
         uint256 hash;
         CBlockIndex *pindex;  //! Optional.
         int64_t nTime;  //! Time of "getdata" request in microseconds.
-        int nValidatedQueuedBefore;  //! Number of blocks queued with validated headers (globally) at the time this one is requested.
         bool fValidatedHeaders;  //! Whether this block has validated headers at the time of request.
+        int64_t nTimeDisconnect; //! The timeout for this block request (for disconnecting a slow peer)
     };
     map<uint256, pair<NodeId, list<QueuedBlock>::iterator> > mapBlocksInFlight;
 
@@ -225,8 +225,8 @@ namespace {
 // Registration of network node signals.
 //
 
-namespace
-{
+namespace {
+
 struct CBlockReject {
     unsigned char chRejectCode;
     string strRejectReason;
@@ -336,7 +336,7 @@ struct CNodeState {
     //! List of asynchronously-determined block rejections to notify this peer about.
     std::vector<CBlockReject> rejects;
     //! The best known block we know this peer has announced.
-    CBlockIndex* pindexBestKnownBlock;
+    CBlockIndex *pindexBestKnownBlock;
     //! The hash of the last unknown block this peer has announced.
     uint256 hashLastUnknownBlock;
     //! The last full block we both have.
@@ -351,6 +351,7 @@ struct CNodeState {
     int64_t nStallingSince;
     list<QueuedBlock> vBlocksInFlight;
     int nBlocksInFlight;
+    int nBlocksInFlightValidHeaders;
     //! Whether we consider this a preferred download peer.
     bool fPreferredDownload;
     //! Whether this peer wants invs or headers (when possible) for block announcements.
@@ -370,6 +371,7 @@ struct CNodeState {
         fSyncStarted = false;
         nStallingSince = 0;
         nBlocksInFlight = 0;
+        nBlocksInFlightValidHeaders = 0;
         fPreferredDownload = false;
         fPreferHeaders = false;
     }
@@ -388,14 +390,8 @@ CNodeState *State(NodeId pnode) {
 
 int GetHeight()
 {
-    while (true) {
-        TRY_LOCK(cs_main, lockMain);
-        if (!lockMain) {
-            MilliSleep(50);
-            continue;
-        }
-        return chainActive.Height();
-    }
+    LOCK(cs_main);
+    return chainActive.Height();
 }
 
 void UpdatePreferredDownload(CNode* node, CNodeState* state)
@@ -408,18 +404,22 @@ void UpdatePreferredDownload(CNode* node, CNodeState* state)
     nPreferredDownload += state->fPreferredDownload;
 }
 
-void InitializeNode(NodeId nodeid, const CNode* pnode)
+// Returns time at which to timeout block request (nTime in microseconds)
+int64_t GetBlockTimeout(int64_t nTime, int nValidatedQueuedBefore, const Consensus::Params &consensusParams)
 {
+    return nTime + 500000 * consensusParams.nPowTargetSpacing * (4 + nValidatedQueuedBefore);
+}
+
+void InitializeNode(NodeId nodeid, const CNode *pnode) {
     LOCK(cs_main);
-    CNodeState& state = mapNodeState.insert(std::make_pair(nodeid, CNodeState())).first->second;
+    CNodeState &state = mapNodeState.insert(std::make_pair(nodeid, CNodeState())).first->second;
     state.name = pnode->addrName;
     state.address = pnode->addr;
 }
 
-void FinalizeNode(NodeId nodeid)
-{
+void FinalizeNode(NodeId nodeid) {
     LOCK(cs_main);
-    CNodeState* state = State(nodeid);
+    CNodeState *state = State(nodeid);
 
     if (state->fSyncStarted)
         nSyncStarted--;
@@ -437,17 +437,20 @@ void FinalizeNode(NodeId nodeid)
 }
 
 // Requires cs_main.
-void MarkBlockAsReceived(const uint256& hash)
-{
+// Returns a bool indicating whether we requested this block.
+bool MarkBlockAsReceived(const uint256& hash) {
     map<uint256, pair<NodeId, list<QueuedBlock>::iterator> >::iterator itInFlight = mapBlocksInFlight.find(hash);
     if (itInFlight != mapBlocksInFlight.end()) {
-        CNodeState* state = State(itInFlight->second.first);
+        CNodeState *state = State(itInFlight->second.first);
         nQueuedValidatedHeaders -= itInFlight->second.second->fValidatedHeaders;
+        state->nBlocksInFlightValidHeaders -= itInFlight->second.second->fValidatedHeaders;
         state->vBlocksInFlight.erase(itInFlight->second.second);
         state->nBlocksInFlight--;
         state->nStallingSince = 0;
         mapBlocksInFlight.erase(itInFlight);
+        return true;
     }
+    return false;
 }
 
 // Requires cs_main.
@@ -458,10 +461,12 @@ void MarkBlockAsInFlight(NodeId nodeid, const uint256& hash, CBlockIndex *pindex
     // Make sure it's not listed somewhere already.
     MarkBlockAsReceived(hash);
 
-    QueuedBlock newentry = {hash, pindex, GetTimeMicros(), nQueuedValidatedHeaders, pindex != NULL};
+    int64_t nNow = GetTimeMicros();
+    QueuedBlock newentry = {hash, pindex, nNow, pindex != NULL, GetBlockTimeout(nNow, nQueuedValidatedHeaders, consensusParams)};
     nQueuedValidatedHeaders += newentry.fValidatedHeaders;
     list<QueuedBlock>::iterator it = state->vBlocksInFlight.insert(state->vBlocksInFlight.end(), newentry);
     state->nBlocksInFlight++;
+    state->nBlocksInFlightValidHeaders += newentry.fValidatedHeaders;
     mapBlocksInFlight[hash] = std::make_pair(nodeid, it);
 }
 
@@ -1535,11 +1540,11 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState& state, const CTransa
 
         // Check for non-standard pay-to-script-hash in inputs
         if (Params().RequireStandard() && !AreInputsStandard(tx, view))
-            return error("AcceptToMemoryPool: : nonstandard transaction input");
+            return error("AcceptToMemoryPool: nonstandard transaction input");
 
         // Check that the transaction doesn't have an excessive number of
         // sigops, making it impossible to mine. Since the coinbase transaction
-        // itself can contain sigops MAX_TX_SIGOPS is less than
+        // itself can contain sigops MAX_STANDARD_TX_SIGOPS is less than
         // MAX_BLOCK_SIGOPS; we still consider this an invalid rather than
         // merely non-standard transaction.
         if (!tx.IsZerocoinSpend()) {
@@ -2221,15 +2226,32 @@ void UpdateCoins(const CTransaction& tx, CValidationState &state, CCoinsViewCach
     // mark inputs spent
     if (!tx.IsCoinBase() && !tx.IsZerocoinSpend()) {
         txundo.vprevout.reserve(tx.vin.size());
-        BOOST_FOREACH (const CTxIn& txin, tx.vin) {
-            txundo.vprevout.push_back(CTxInUndo());
-            bool ret = inputs.ModifyCoins(txin.prevout.hash)->Spend(txin.prevout, txundo.vprevout.back());
-            assert(ret);
+        BOOST_FOREACH(const CTxIn &txin, tx.vin) {
+            CCoinsModifier coins = inputs.ModifyCoins(txin.prevout.hash);
+            unsigned nPos = txin.prevout.n;
+
+            if (nPos >= coins->vout.size() || coins->vout[nPos].IsNull())
+                assert(false);
+            // mark an outpoint spent, and construct undo information
+            txundo.vprevout.push_back(CTxInUndo(coins->vout[nPos]));
+            coins->Spend(nPos);
+            if (coins->vout.size() == 0) {
+                CTxInUndo& undo = txundo.vprevout.back();
+                undo.nHeight = coins->nHeight;
+                undo.fCoinBase = coins->fCoinBase;
+                undo.nVersion = coins->nVersion;
+            }
         }
     }
 
     // add outputs
     inputs.ModifyCoins(tx.GetHash())->FromTx(tx, nHeight);
+}
+
+void UpdateCoins(const CTransaction& tx, CValidationState &state, CCoinsViewCache &inputs, int nHeight)
+{
+    CTxUndo txundo;
+    UpdateCoins(tx, state, inputs, txundo, nHeight);
 }
 
 bool CScriptCheck::operator()() {
@@ -2327,9 +2349,10 @@ bool CheckInputs(const CTransaction& tx, CValidationState& state, const CCoinsVi
         int nSpendHeight = pindexPrev->nHeight + 1;
         CAmount nValueIn = 0;
         CAmount nFees = 0;
-        for (unsigned int i = 0; i < tx.vin.size(); i++) {
-            const COutPoint& prevout = tx.vin[i].prevout;
-            const CCoins* coins = inputs.AccessCoins(prevout.hash);
+        for (unsigned int i = 0; i < tx.vin.size(); i++)
+        {
+            const COutPoint &prevout = tx.vin[i].prevout;
+            const CCoins *coins = inputs.AccessCoins(prevout.hash);
             assert(coins);
 
             // If prev is coinbase, check that it's matured
@@ -3257,8 +3280,7 @@ bool static FlushStateToDisk(CValidationState& state, FlushStateMode mode)
     return true;
 }
 
-void FlushStateToDisk()
-{
+void FlushStateToDisk() {
     CValidationState state;
     FlushStateToDisk(state, FLUSH_STATE_ALWAYS);
 }
@@ -3932,7 +3954,7 @@ bool ReceivedBlockTransactions(const CBlock& block, CValidationState& state, CBl
     return true;
 }
 
-bool FindBlockPos(CValidationState& state, CDiskBlockPos& pos, unsigned int nAddSize, unsigned int nHeight, uint64_t nTime, bool fKnown = false)
+bool FindBlockPos(CValidationState &state, CDiskBlockPos &pos, unsigned int nAddSize, unsigned int nHeight, uint64_t nTime, bool fKnown = false)
 {
     LOCK(cs_LastBlockFile);
 
@@ -3943,8 +3965,6 @@ bool FindBlockPos(CValidationState& state, CDiskBlockPos& pos, unsigned int nAdd
 
     if (!fKnown) {
         while (vinfoBlockFile[nFile].nSize + nAddSize >= MAX_BLOCKFILE_SIZE) {
-            LogPrintf("Leaving block file %i: %s\n", nFile, vinfoBlockFile[nFile].ToString());
-            FlushBlockFile(true);
             nFile++;
             if (vinfoBlockFile.size() <= nFile) {
                 vinfoBlockFile.resize(nFile + 1);
@@ -3954,7 +3974,14 @@ bool FindBlockPos(CValidationState& state, CDiskBlockPos& pos, unsigned int nAdd
         pos.nPos = vinfoBlockFile[nFile].nSize;
     }
 
-    nLastBlockFile = nFile;
+    if (nFile != nLastBlockFile) {
+        if (!fKnown) {
+            LogPrintf("Leaving block file %i: %s\n", nFile, vinfoBlockFile[nFile].ToString());
+        }
+        FlushBlockFile(!fKnown);
+        nLastBlockFile = nFile;
+    }
+
     vinfoBlockFile[nFile].AddBlock(nHeight, nTime);
     if (fKnown)
         vinfoBlockFile[nFile].nSize = std::max(pos.nPos + nAddSize, vinfoBlockFile[nFile].nSize);
@@ -3966,13 +3993,14 @@ bool FindBlockPos(CValidationState& state, CDiskBlockPos& pos, unsigned int nAdd
         unsigned int nNewChunks = (vinfoBlockFile[nFile].nSize + BLOCKFILE_CHUNK_SIZE - 1) / BLOCKFILE_CHUNK_SIZE;
         if (nNewChunks > nOldChunks) {
             if (CheckDiskSpace(nNewChunks * BLOCKFILE_CHUNK_SIZE - pos.nPos)) {
-                FILE* file = OpenBlockFile(pos);
+                FILE *file = OpenBlockFile(pos);
                 if (file) {
                     LogPrintf("Pre-allocating up to position 0x%x in blk%05u.dat\n", nNewChunks * BLOCKFILE_CHUNK_SIZE, pos.nFile);
                     AllocateFileRange(file, pos.nPos, nNewChunks * BLOCKFILE_CHUNK_SIZE - pos.nPos);
                     fclose(file);
                 }
-            } else
+            }
+            else
                 return state.Error("out of disk space");
         }
     }
@@ -3981,7 +4009,7 @@ bool FindBlockPos(CValidationState& state, CDiskBlockPos& pos, unsigned int nAdd
     return true;
 }
 
-bool FindUndoPos(CValidationState& state, int nFile, CDiskBlockPos& pos, unsigned int nAddSize)
+bool FindUndoPos(CValidationState &state, int nFile, CDiskBlockPos &pos, unsigned int nAddSize)
 {
     pos.nFile = nFile;
 
@@ -3996,13 +4024,14 @@ bool FindUndoPos(CValidationState& state, int nFile, CDiskBlockPos& pos, unsigne
     unsigned int nNewChunks = (nNewSize + UNDOFILE_CHUNK_SIZE - 1) / UNDOFILE_CHUNK_SIZE;
     if (nNewChunks > nOldChunks) {
         if (CheckDiskSpace(nNewChunks * UNDOFILE_CHUNK_SIZE - pos.nPos)) {
-            FILE* file = OpenUndoFile(pos);
+            FILE *file = OpenUndoFile(pos);
             if (file) {
                 LogPrintf("Pre-allocating up to position 0x%x in rev%05u.dat\n", nNewChunks * UNDOFILE_CHUNK_SIZE, pos.nFile);
                 AllocateFileRange(file, pos.nPos, nNewChunks * UNDOFILE_CHUNK_SIZE - pos.nPos);
                 fclose(file);
             }
-        } else
+        }
+        else
             return state.Error("out of disk space");
     }
 
@@ -4280,10 +4309,15 @@ bool ContextualCheckBlock(const CBlock& block, CValidationState& state, CBlockIn
     const int nHeight = pindexPrev == NULL ? 0 : pindexPrev->nHeight + 1;
 
     // Check that all transactions are finalized
-    BOOST_FOREACH (const CTransaction& tx, block.vtx)
-        if (!IsFinalTx(tx, nHeight, block.GetBlockTime())) {
-            return state.DoS(10, error("%s : contains a non-final transaction", __func__), REJECT_INVALID, "bad-txns-nonfinal");
+    BOOST_FOREACH(const CTransaction& tx, block.vtx) {
+        int nLockTimeFlags = 0;
+        int64_t nLockTimeCutoff = (nLockTimeFlags & LOCKTIME_MEDIAN_TIME_PAST)
+                                ? pindexPrev->GetMedianTimePast()
+                                : block.GetBlockTime();
+        if (!IsFinalTx(tx, nHeight, nLockTimeCutoff)) {
+            return state.DoS(10, error("%s: contains a non-final transaction", __func__), REJECT_INVALID, "bad-txns-nonfinal");
         }
+    }
 
     // Enforce block.nVersion=2 rule that the coinbase starts with serialized block height
     // if 750 of the last 1,000 blocks are version 2 or greater (51/100 if testnet):
@@ -4292,7 +4326,7 @@ bool ContextualCheckBlock(const CBlock& block, CValidationState& state, CBlockIn
         CScript expect = CScript() << nHeight;
         if (block.vtx[0].vin[0].scriptSig.size() < expect.size() ||
             !std::equal(expect.begin(), expect.end(), block.vtx[0].vin[0].scriptSig.begin())) {
-            return state.DoS(100, error("%s : block height mismatch in coinbase", __func__), REJECT_INVALID, "bad-cb-height");
+            return state.DoS(100, error("%s: block height mismatch in coinbase", __func__), REJECT_INVALID, "bad-cb-height");
         }
     }
 
@@ -5633,8 +5667,9 @@ void static ProcessGetData(CNode* pfrom)
                             // no response
                     }
 
-                    // Trigger them to send a getblocks request for the next batch of inventory
-                    if (inv.hash == pfrom->hashContinue) {
+                    // Trigger the peer node to send a getblocks request for the next batch of inventory
+                    if (inv.hash == pfrom->hashContinue)
+                    {
                         // Bypass PushInventory, this must send even if redundant,
                         // and we want it right after the last block so they don't
                         // wait for other stuff first.
@@ -6046,8 +6081,9 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
 
         std::vector<CInv> vToFetch;
 
-        for (unsigned int nInv = 0; nInv < vInv.size(); nInv++) {
-            const CInv& inv = vInv[nInv];
+        for (unsigned int nInv = 0; nInv < vInv.size(); nInv++)
+        {
+            const CInv &inv = vInv[nInv];
 
             boost::this_thread::interruption_point();
             pfrom->AddInventoryKnown(inv);
@@ -6069,7 +6105,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                     }
                     else
                     {
-                        // First request the headers preceeding the announced block. In the normal fully-synced
+                        // First request the headers preceding the announced block. In the normal fully-synced
                         // case where a new block is announced that succeeds the current tip (no reorganization),
                         // there are no such headers.
                         // Secondly, and only when we are close to being synced, we request the announced block directly,
@@ -7279,9 +7315,22 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
         // timeout. We compensate for in-flight blocks to prevent killing off peers due to our own downstream link
         // being saturated. We only count validated in-flight blocks so peers can't advertise non-existing block hashes
         // to unreasonably increase our timeout.
-        if (!pto->fDisconnect && state.vBlocksInFlight.size() > 0 && state.vBlocksInFlight.front().nTime < nNow - 500000 * Params().TargetSpacing() * (4 + state.vBlocksInFlight.front().nValidatedQueuedBefore)) {
-            LogPrintf("Timeout downloading block %s from peer=%d, disconnecting\n", state.vBlocksInFlight.front().hash.ToString(), pto->id);
-            pto->fDisconnect = true;
+        // We also compare the block download timeout originally calculated against the time at which we'd disconnect
+        // if we assumed the block were being requested now (ignoring blocks we've requested from this peer, since we're
+        // only looking at this peer's oldest request).  This way a large queue in the past doesn't result in a
+        // permanently large window for this block to be delivered (ie if the number of blocks in flight is decreasing
+        // more quickly than once every 5 minutes, then we'll shorten the download window for this block).
+        if (!pto->fDisconnect && state.vBlocksInFlight.size() > 0) {
+            QueuedBlock &queuedBlock = state.vBlocksInFlight.front();
+            int64_t nTimeoutIfRequestedNow = GetBlockTimeout(nNow, nQueuedValidatedHeaders - state.nBlocksInFlightValidHeaders, consensusParams);
+            if (queuedBlock.nTimeDisconnect > nTimeoutIfRequestedNow) {
+                LogPrint("net", "Reducing block download timeout for peer=%d block=%s, orig=%d new=%d\n", pto->id, queuedBlock.hash.ToString(), queuedBlock.nTimeDisconnect, nTimeoutIfRequestedNow);
+                queuedBlock.nTimeDisconnect = nTimeoutIfRequestedNow;
+            }
+            if (queuedBlock.nTimeDisconnect < nNow) {
+                LogPrintf("Timeout downloading block %s from peer=%d, disconnecting\n", queuedBlock.hash.ToString(), pto->id);
+                pto->fDisconnect = true;
+            }
         }
 
         //
