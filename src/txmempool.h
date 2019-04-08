@@ -16,6 +16,7 @@
 #include "sync.h"
 
 class CAutoFile;
+class CBlockIndex;
 
 inline double AllowFreeThreshold()
 {
@@ -33,6 +34,21 @@ inline bool AllowFree(double dPriority)
 /** Fake height value used in CCoins to signify they are only in the memory pool (since 0.8) */
 static const unsigned int MEMPOOL_HEIGHT = 0x7FFFFFFF;
 
+struct LockPoints
+{
+    // Will be set to the blockchain height and median time past
+    // values that would be necessary to satisfy all relative locktime
+    // constraints (BIP68) of this tx given our view of block chain history
+    int height;
+    int64_t time;
+    // As long as the current chain descends from the highest height block
+    // containing one of the inputs used in the calculation, then the cached
+    // values are still valid even after a reorg.
+    CBlockIndex* maxInputBlock;
+
+    LockPoints() : height(0), time(0), maxInputBlock(NULL) { }
+};
+
 /**
  * CTxMemPool stores these:
  */
@@ -46,9 +62,10 @@ private:
     int64_t nTime;        //! Local time when entering the mempool
     double dPriority;     //! Priority when entering the mempool
     unsigned int nHeight; //! Chain height when entering the mempool
+    LockPoints lockPoints;//! Track the height and time at which tx was final
 
 public:
-    CTxMemPoolEntry(const CTransaction& _tx, const CAmount& _nFee, int64_t _nTime, double _dPriority, unsigned int _nHeight);
+    CTxMemPoolEntry(const CTransaction& _tx, const CAmount& _nFee, int64_t _nTime, double _dPriority, unsigned int _nHeight, LockPoints lp);
     CTxMemPoolEntry();
     CTxMemPoolEntry(const CTxMemPoolEntry& other);
 
@@ -58,6 +75,20 @@ public:
     size_t GetTxSize() const { return nTxSize; }
     int64_t GetTime() const { return nTime; }
     unsigned int GetHeight() const { return nHeight; }
+    const LockPoints& GetLockPoints() const { return lockPoints; }
+
+    // Update the LockPoints after a reorg
+    void UpdateLockPoints(const LockPoints& lp);
+};
+
+struct update_lock_points
+{
+    update_lock_points(const LockPoints& _lp) : lp(_lp) { }
+
+    void operator() (CTxMemPoolEntry &e) { e.UpdateLockPoints(lp); }
+
+private:
+    const LockPoints& lp;
 };
 
 class CMinerPolicyEstimator;

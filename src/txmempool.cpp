@@ -23,7 +23,7 @@ CTxMemPoolEntry::CTxMemPoolEntry() : nFee(0), nTxSize(0), nModSize(0), nTime(0),
     nHeight = MEMPOOL_HEIGHT;
 }
 
-CTxMemPoolEntry::CTxMemPoolEntry(const CTransaction& _tx, const CAmount& _nFee, int64_t _nTime, double _dPriority, unsigned int _nHeight) : tx(_tx), nFee(_nFee), nTime(_nTime), dPriority(_dPriority), nHeight(_nHeight)
+CTxMemPoolEntry::CTxMemPoolEntry(const CTransaction& _tx, const CAmount& _nFee, int64_t _nTime, double _dPriority, unsigned int _nHeight, LockPoints lp) : tx(_tx), nFee(_nFee), nTime(_nTime), dPriority(_dPriority), nHeight(_nHeight), lockPoints(lp)
 {
     nTxSize = ::GetSerializeSize(tx, SER_NETWORK, PROTOCOL_VERSION);
 
@@ -42,6 +42,11 @@ CTxMemPoolEntry::GetPriority(unsigned int currentHeight) const
     double deltaPriority = ((double)(currentHeight - nHeight) * nValueIn) / nModSize;
     double dResult = dPriority + deltaPriority;
     return dResult;
+}
+
+void CTxMemPoolEntry::UpdateLockPoints(const LockPoints& lp)
+{
+    lockPoints = lp;
 }
 
 /**
@@ -474,7 +479,11 @@ void CTxMemPool::removeForReorg(const CCoinsViewCache *pcoins, unsigned int nMem
     list<CTransaction> transactionsToRemove;
     for (std::map<uint256, CTxMemPoolEntry>::const_iterator it = mapTx.begin(); it != mapTx.end(); it++) {
         const CTransaction& tx = it->second.GetTx();
-        if (!CheckFinalTx(tx, flags) || !CheckSequenceLocks(tx, flags)) {
+        LockPoints lp = it->GetLockPoints();
+        bool validLP =  TestLockPointValidity(&lp);
+        if (!CheckFinalTx(tx, flags) || !CheckSequenceLocks(tx, flags, &lp, validLP)) {
+            // Note if CheckSequenceLocks fails the LockPoints may still be invalid
+            // So it's critical that we remove the tx and not depend on the LockPoints.
             transactionsToRemove.push_back(tx);
         } else {
             BOOST_FOREACH (const CTxIn& txin, tx.vin) {
@@ -488,6 +497,9 @@ void CTxMemPool::removeForReorg(const CCoinsViewCache *pcoins, unsigned int nMem
                     break;
                 }
             }
+        }
+        if (!validLP) {
+            mapTx.modify(it, update_lock_points(lp));
         }
     }
     BOOST_FOREACH(const CTransaction& tx, transactionsToRemove) {

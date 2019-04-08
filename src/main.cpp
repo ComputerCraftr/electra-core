@@ -954,7 +954,25 @@ bool SequenceLocks(const CTransaction &tx, int flags, std::vector<int>* prevHeig
     return EvaluateSequenceLocks(block, CalculateSequenceLocks(tx, flags, prevHeights, block));
 }
 
-bool CheckSequenceLocks(const CTransaction &tx, int flags)
+bool TestLockPointValidity(const LockPoints* lp)
+{
+    AssertLockHeld(cs_main);
+    assert(lp);
+    // If there are relative lock times then the maxInputBlock will be set
+    // If there are no relative lock times, the LockPoints don't depend on the chain
+    if (lp->maxInputBlock) {
+        // Check whether chainActive is an extension of the block at which the LockPoints
+        // calculation was valid.  If not LockPoints are no longer valid
+        if (!chainActive.Contains(lp->maxInputBlock)) {
+            return false;
+        }
+    }
+
+    // LockPoints still valid
+    return true;
+}
+
+bool CheckSequenceLocks(const CTransaction &tx, int flags, LockPoints* lp, bool useExistingLockPoints)
 {
     AssertLockHeld(cs_main);
     AssertLockHeld(mempool.cs);
@@ -970,25 +988,57 @@ bool CheckSequenceLocks(const CTransaction &tx, int flags)
     // *next* block, we need to use one more than chainActive.Height()
     index.nHeight = tip->nHeight + 1;
 
-    // pcoinsTip contains the UTXO set for chainActive.Tip()
-    CCoinsViewMemPool viewMemPool(pcoinsTip, mempool);
-    std::vector<int> prevheights;
-    prevheights.resize(tx.vin.size());
-    for (size_t txinIndex = 0; txinIndex < tx.vin.size(); txinIndex++) {
-        const CTxIn& txin = tx.vin[txinIndex];
-        CCoins coins;
-        if (!viewMemPool.GetCoins(txin.prevout.hash, coins)) {
-            return error("%s: Missing input", __func__);
+    std::pair<int, int64_t> lockPair;
+    if (useExistingLockPoints) {
+        assert(lp);
+        lockPair.first = lp->height;
+        lockPair.second = lp->time;
+    }
+    else {
+        // pcoinsTip contains the UTXO set for chainActive.Tip()
+        CCoinsViewMemPool viewMemPool(pcoinsTip, mempool);
+        std::vector<int> prevheights;
+        prevheights.resize(tx.vin.size());
+        for (size_t txinIndex = 0; txinIndex < tx.vin.size(); txinIndex++) {
+            const CTxIn& txin = tx.vin[txinIndex];
+            CCoins coins;
+            if (!viewMemPool.GetCoins(txin.prevout.hash, coins)) {
+                return error("%s: Missing input", __func__);
+            }
+            if (coins.nHeight == MEMPOOL_HEIGHT) {
+                // Assume all mempool transaction confirm in the next block
+                prevheights[txinIndex] = tip->nHeight + 1;
+            } else {
+                prevheights[txinIndex] = coins.nHeight;
+            }
         }
-        if (coins.nHeight == MEMPOOL_HEIGHT) {
-            // Assume all mempool transaction confirm in the next block
-            prevheights[txinIndex] = tip->nHeight + 1;
-        } else {
-            prevheights[txinIndex] = coins.nHeight;
+        lockPair = CalculateSequenceLocks(tx, flags, &prevheights, index);
+        if (lp) {
+            lp->height = lockPair.first;
+            lp->time = lockPair.second;
+            // Also store the hash of the block with the highest height of
+            // all the blocks which have sequence locked prevouts.
+            // This hash needs to still be on the chain
+            // for these LockPoint calculations to be valid
+            // Note: It is impossible to correctly calculate a maxInputBlock
+            // if any of the sequence locked inputs depend on unconfirmed txs,
+            // except in the special case where the relative lock time/height
+            // is 0, which is equivalent to no sequence lock. Since we assume
+            // input height of tip+1 for mempool txs and test the resulting
+            // lockPair from CalculateSequenceLocks against tip+1.  We know
+            // EvaluateSequenceLocks will fail if there was a non-zero sequence
+            // lock on a mempool input, so we can use the return value of
+            // CheckSequenceLocks to indicate the LockPoints validity
+            int maxInputHeight = 0;
+            BOOST_FOREACH(int height, prevheights) {
+                // Can ignore mempool inputs since we'll fail if they had non-zero locks
+                if (height != tip->nHeight+1) {
+                    maxInputHeight = std::max(maxInputHeight, height);
+                }
+            }
+            lp->maxInputBlock = tip->GetAncestor(maxInputHeight);
         }
     }
-
-    std::pair<int, int64_t> lockPair = CalculateSequenceLocks(tx, flags, &prevheights, index);
     return EvaluateSequenceLocks(index, lockPair);
 }
 
@@ -1490,7 +1540,7 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState& state, const CTransa
 
     // Temporarily disable zerocoin for maintenance
     if (GetAdjustedTime() > GetSporkValue(SPORK_16_ZEROCOIN_MAINTENANCE_MODE) && tx.ContainsZerocoins())
-        return state.DoS(10, error("AcceptToMemoryPool : Zerocoin transactions are temporarily disabled for maintenance"), REJECT_INVALID, "bad-tx");
+        return state.DoS(10, error("AcceptToMemoryPool: Zerocoin transactions are temporarily disabled for maintenance"), REJECT_INVALID, "bad-tx");
 
     int chainHeight = chainActive.Height();
     if (chainHeight < Params().Zerocoin_Block_V2_Start() && !IsInitialBlockDownload() && tx.ContainsZerocoins())
@@ -1519,7 +1569,7 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState& state, const CTransa
     string reason;
     if (Params().RequireStandard() && !IsStandardTx(tx, reason))
         return state.DoS(0,
-                         error("AcceptToMemoryPool : nonstandard transaction: %s", reason),
+                         error("AcceptToMemoryPool: nonstandard transaction: %s", reason),
                          REJECT_NONSTANDARD, reason);
 
     // is it already in the memory pool?
@@ -1535,7 +1585,7 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState& state, const CTransa
         if (mapLockedInputs.count(in.prevout)) {
             if (mapLockedInputs[in.prevout] != tx.GetHash()) {
                 return state.DoS(0,
-                    error("AcceptToMemoryPool : conflicts with existing transaction lock: %s", reason),
+                    error("AcceptToMemoryPool: conflicts with existing transaction lock: %s", reason),
                     REJECT_INVALID, "tx-lock-conflict");
             }
         }
@@ -1559,13 +1609,14 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState& state, const CTransa
         CCoinsViewCache view(&dummy);
 
         CAmount nValueIn = 0;
+        LockPoints lp;
         if(tx.IsZerocoinSpend()){
             nValueIn = tx.GetZerocoinSpent();
 
             //Check that txid is not already in the chain
             int nHeightTx = 0;
             if (IsTransactionInChain(tx.GetHash(), nHeightTx))
-                return state.Invalid(error("AcceptToMemoryPool : zECA spend tx %s already in block %d",
+                return state.Invalid(error("AcceptToMemoryPool: zECA spend tx %s already in block %d",
                                            tx.GetHash().GetHex(), nHeightTx), REJECT_DUPLICATE, "bad-txns-inputs-spent");
 
             //Check for double spending of serial #'s
@@ -1620,7 +1671,7 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState& state, const CTransa
 
             // are the actual inputs available?
             if (!view.HaveInputs(tx))
-                return state.Invalid(error("AcceptToMemoryPool : inputs already spent"),
+                return state.Invalid(error("AcceptToMemoryPool: inputs already spent"),
                     REJECT_DUPLICATE, "bad-txns-inputs-spent");
 
             // Bring the best block into scope
@@ -1630,15 +1681,14 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState& state, const CTransa
 
             // we have all inputs cached now, so switch back to dummy, so we don't need to keep lock on mempool
             view.SetBackend(dummy);
-        }
 
-        // Only accept BIP68 sequence locked transactions that can be mined in the next
-        // block; we don't want our mempool filled up with transactions that can't
-        // be mined yet.
-        // Must keep pool.cs for this unless we change CheckSequenceLocks to take a
-        // CoinsViewCache instead of create its own
-        if (!CheckSequenceLocks(tx, STANDARD_LOCKTIME_VERIFY_FLAGS)) {
-            return state.DoS(0, false, REJECT_NONSTANDARD, "non-BIP68-final");
+            // Only accept BIP68 sequence locked transactions that can be mined in the next
+            // block; we don't want our mempool filled up with transactions that can't
+            // be mined yet.
+            // Must keep pool.cs for this unless we change CheckSequenceLocks to take a
+            // CoinsViewCache instead of create its own
+            if (!CheckSequenceLocks(tx, STANDARD_LOCKTIME_VERIFY_FLAGS, &lp))
+                return state.DoS(0, false, REJECT_NONSTANDARD, "non-BIP68-final");
         }
 
         // Check for non-standard pay-to-script-hash in inputs
@@ -1656,7 +1706,7 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState& state, const CTransa
             nSigOps += GetP2SHSigOpCount(tx, view);
             if(nSigOps > nMaxSigOps)
                 return state.DoS(0,
-                                 error("AcceptToMemoryPool : too many sigops %s, %d > %d",
+                                 error("AcceptToMemoryPool: too many sigops %s, %d > %d",
                                        hash.ToString(), nSigOps, nMaxSigOps),
                                  REJECT_NONSTANDARD, "bad-txns-too-many-sigops");
         }
@@ -1667,7 +1717,7 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState& state, const CTransa
         if (!tx.IsZerocoinSpend())
             view.GetPriority(tx, chainActive.Height());
 
-        CTxMemPoolEntry entry(tx, nFees, GetTime(), dPriority, chainActive.Height());
+        CTxMemPoolEntry entry(tx, nFees, GetTime(), dPriority, chainActive.Height(), lp);
         unsigned int nSize = entry.GetTxSize();
 
         // Don't accept it if it can't get into a block
@@ -1677,7 +1727,7 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState& state, const CTransa
         } else if (!ignoreFees) {
             CAmount txMinFee = GetMinRelayFee(tx, nSize, true);
             if (fLimitFree && nFees < txMinFee && !tx.IsZerocoinSpend())
-                return state.DoS(0, error("AcceptToMemoryPool : not enough fees %s, %d < %d",
+                return state.DoS(0, error("AcceptToMemoryPool: not enough fees %s, %d < %d",
                                         hash.ToString(), nFees, txMinFee),
                     REJECT_INSUFFICIENTFEE, "insufficient fee");
 
@@ -1706,7 +1756,7 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState& state, const CTransa
                 // -limitfreerelay unit is thousand-bytes-per-minute
                 // At default rate it would take over a month to fill 1GB
                 if (dFreeCount >= GetArg("-limitfreerelay", 30) * 10 * 1000)
-                    return state.DoS(0, error("AcceptToMemoryPool : free transaction rejected by rate limiter"),
+                    return state.DoS(0, error("AcceptToMemoryPool: free transaction rejected by rate limiter"),
                         REJECT_INSUFFICIENTFEE, "rate limited free transaction");
                 LogPrint("mempool", "Rate limit dFreeCount: %g => %g\n", dFreeCount, dFreeCount + nSize);
                 dFreeCount += nSize;
@@ -1772,7 +1822,7 @@ bool AcceptableInputs(CTxMemPool& pool, CValidationState& state, const CTransact
     // for any real tx this will be checked on AcceptToMemoryPool anyway
     //    if (Params().RequireStandard() && !IsStandardTx(tx, reason))
     //        return state.DoS(0,
-    //                         error("AcceptableInputs : nonstandard transaction: %s", reason),
+    //                         error("AcceptableInputs: nonstandard transaction: %s", reason),
     //                         REJECT_NONSTANDARD, reason);
 
     // is it already in the memory pool?
@@ -1786,7 +1836,7 @@ bool AcceptableInputs(CTxMemPool& pool, CValidationState& state, const CTransact
         if (mapLockedInputs.count(in.prevout)) {
             if (mapLockedInputs[in.prevout] != tx.GetHash()) {
                 return state.DoS(0,
-                    error("AcceptableInputs : conflicts with existing transaction lock: %s", reason),
+                    error("AcceptableInputs: conflicts with existing transaction lock: %s", reason),
                     REJECT_INVALID, "tx-lock-conflict");
             }
         }
@@ -1810,6 +1860,7 @@ bool AcceptableInputs(CTxMemPool& pool, CValidationState& state, const CTransact
         CCoinsViewCache view(&dummy);
 
         CAmount nValueIn = 0;
+        LockPoints lp;
         {
             LOCK(pool.cs);
             CCoinsViewMemPool viewMemPool(pcoinsTip, pool);
@@ -1838,7 +1889,7 @@ bool AcceptableInputs(CTxMemPool& pool, CValidationState& state, const CTransact
 
             // are the actual inputs available?
             if (!view.HaveInputs(tx))
-                return state.Invalid(error("AcceptableInputs : inputs already spent"),
+                return state.Invalid(error("AcceptableInputs: inputs already spent"),
                     REJECT_DUPLICATE, "bad-txns-inputs-spent");
 
             // Bring the best block into scope
@@ -1848,6 +1899,14 @@ bool AcceptableInputs(CTxMemPool& pool, CValidationState& state, const CTransact
 
             // we have all inputs cached now, so switch back to dummy, so we don't need to keep lock on mempool
             view.SetBackend(dummy);
+
+            // Only accept BIP68 sequence locked transactions that can be mined in the next
+            // block; we don't want our mempool filled up with transactions that can't
+            // be mined yet.
+            // Must keep pool.cs for this unless we change CheckSequenceLocks to take a
+            // CoinsViewCache instead of create its own
+            if (!CheckSequenceLocks(tx, STANDARD_LOCKTIME_VERIFY_FLAGS, &lp))
+                return state.DoS(0, false, REJECT_NONSTANDARD, "non-BIP68-final");
         }
 
         // Check for non-standard pay-to-script-hash in inputs
@@ -1865,7 +1924,7 @@ bool AcceptableInputs(CTxMemPool& pool, CValidationState& state, const CTransact
         nSigOps += GetP2SHSigOpCount(tx, view);
         if (nSigOps > nMaxSigOps)
             return state.DoS(0,
-                error("AcceptableInputs : too many sigops %s, %d > %d",
+                error("AcceptableInputs: too many sigops %s, %d > %d",
                     hash.ToString(), nSigOps, nMaxSigOps),
                 REJECT_NONSTANDARD, "bad-txns-too-many-sigops");
 
@@ -1873,7 +1932,7 @@ bool AcceptableInputs(CTxMemPool& pool, CValidationState& state, const CTransact
         CAmount nFees = nValueIn - nValueOut;
         double dPriority = view.GetPriority(tx, chainActive.Height());
 
-        CTxMemPoolEntry entry(tx, nFees, GetTime(), dPriority, chainActive.Height());
+        CTxMemPoolEntry entry(tx, nFees, GetTime(), dPriority, chainActive.Height(), lp);
         unsigned int nSize = entry.GetTxSize();
 
         // Don't accept it if it can't get into a block
@@ -1883,7 +1942,7 @@ bool AcceptableInputs(CTxMemPool& pool, CValidationState& state, const CTransact
         } else { // same as !ignoreFees for AcceptToMemoryPool
             CAmount txMinFee = GetMinRelayFee(tx, nSize, true);
             if (fLimitFree && nFees < txMinFee && !tx.IsZerocoinSpend())
-                return state.DoS(0, error("AcceptableInputs : not enough fees %s, %d < %d",
+                return state.DoS(0, error("AcceptableInputs: not enough fees %s, %d < %d",
                                         hash.ToString(), nFees, txMinFee),
                     REJECT_INSUFFICIENTFEE, "insufficient fee");
 
@@ -1909,7 +1968,7 @@ bool AcceptableInputs(CTxMemPool& pool, CValidationState& state, const CTransact
                 // -limitfreerelay unit is thousand-bytes-per-minute
                 // At default rate it would take over a month to fill 1GB
                 if (dFreeCount >= GetArg("-limitfreerelay", 30) * 10 * 1000)
-                    return state.DoS(0, error("AcceptableInputs : free transaction rejected by rate limiter"),
+                    return state.DoS(0, error("AcceptableInputs: free transaction rejected by rate limiter"),
                         REJECT_INSUFFICIENTFEE, "rate limited free transaction");
                 LogPrint("mempool", "Rate limit dFreeCount: %g => %g\n", dFreeCount, dFreeCount + nSize);
                 dFreeCount += nSize;
@@ -3029,7 +3088,6 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
 
     int64_t nTimeStart = GetTimeMicros();
     std::vector<int> prevheights;
-    int nLockTimeFlags = STANDARD_LOCKTIME_VERIFY_FLAGS;
     CAmount nFees = 0;
     int nInputs = 0;
     unsigned int nSigOps = 0;
@@ -3117,7 +3175,7 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
                 prevheights[j] = view.AccessCoins(tx.vin[j].prevout.hash)->nHeight;
             }
 
-            if (!SequenceLocks(tx, nLockTimeFlags, &prevheights, *pindex)) {
+            if (!SequenceLocks(tx, STANDARD_LOCKTIME_VERIFY_FLAGS, &prevheights, *pindex)) {
                 return state.DoS(100, error("%s: contains a non-BIP68-final transaction", __func__),
                                  REJECT_INVALID, "bad-txns-nonfinal");
             }
@@ -4424,8 +4482,7 @@ bool ContextualCheckBlock(const CBlock& block, CValidationState& state, CBlockIn
 
     // Check that all transactions are finalized
     BOOST_FOREACH(const CTransaction& tx, block.vtx) {
-        int nLockTimeFlags = STANDARD_LOCKTIME_VERIFY_FLAGS;
-        int64_t nLockTimeCutoff = (nLockTimeFlags & LOCKTIME_MEDIAN_TIME_PAST)
+        int64_t nLockTimeCutoff = (STANDARD_LOCKTIME_VERIFY_FLAGS & LOCKTIME_MEDIAN_TIME_PAST)
                                 ? pindexPrev->GetMedianTimePast()
                                 : block.GetBlockTime();
         if (!IsFinalTx(tx, nHeight, nLockTimeCutoff)) {
