@@ -498,9 +498,9 @@ void CTxMemPool::removeForReorg(const CCoinsViewCache *pcoins, unsigned int nMem
                 }
             }
         }
-        if (!validLP) {
-            mapTx->second.modify(it, update_lock_points(lp));
-        }
+        // if (!validLP) {
+            // mapTx->second.modify(it, update_lock_points(lp));
+        // }
     }
     BOOST_FOREACH(const CTransaction& tx, transactionsToRemove) {
         list<CTransaction> removed;
