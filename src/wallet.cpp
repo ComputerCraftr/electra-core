@@ -1228,7 +1228,7 @@ CAmount CWalletTx::GetDenominatedCredit(bool unconfirmed, bool fUseCache) const
     int nDepth = GetDepthInMainChain(false);
     if (nDepth < 0) return 0;
 
-    bool isUnconfirmed = !IsTrusted() && nDepth == 0 && InMempool();
+    bool isUnconfirmed = !CheckFinalTx(*this) || (!IsTrusted() && nDepth == 0);
     if (unconfirmed != isUnconfirmed) return 0;
 
     if (fUseCache) {

@@ -123,9 +123,10 @@ CBlockTemplate* CreateNewBlock(const CScript& scriptPubKeyIn, CWallet* pwallet, 
     else
         pblock->nVersion = CBlock::CURRENT_VERSION;
 
-	int64_t nLockTimeCutoff = (STANDARD_LOCKTIME_VERIFY_FLAGS & LOCKTIME_MEDIAN_TIME_PAST)
-							? nMedianTimePast
-							: pblock->GetBlockTime();
+    const int64_t nMedianTimePast = pindexPrev->GetMedianTimePast();
+    int64_t nLockTimeCutoff = (STANDARD_LOCKTIME_VERIFY_FLAGS & LOCKTIME_MEDIAN_TIME_PAST)
+                            ? nMedianTimePast
+                            : pblock->GetBlockTime();
 
     // Create coinbase tx
     CMutableTransaction txNew;

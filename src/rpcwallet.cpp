@@ -594,7 +594,7 @@ UniValue getreceivedbyaddress(const UniValue& params, bool fHelp)
     CAmount nAmount = 0;
     for (std::map<uint256, CWalletTx>::iterator it = pwalletMain->mapWallet.begin(); it != pwalletMain->mapWallet.end(); ++it) {
         const CWalletTx& wtx = (*it).second;
-        if (wtx.IsCoinBase() || !IsFinalTx(wtx))
+        if (wtx.IsCoinBase() || !CheckFinalTx(wtx))
             continue;
 
         BOOST_FOREACH (const CTxOut& txout, wtx.vout)
@@ -646,7 +646,7 @@ UniValue getreceivedbyaccount(const UniValue& params, bool fHelp)
     CAmount nAmount = 0;
     for (map<uint256, CWalletTx>::iterator it = pwalletMain->mapWallet.begin(); it != pwalletMain->mapWallet.end(); ++it) {
         const CWalletTx& wtx = (*it).second;
-        if (wtx.IsCoinBase() || !IsFinalTx(wtx))
+        if (wtx.IsCoinBase() || !CheckFinalTx(wtx))
             continue;
 
         BOOST_FOREACH (const CTxOut& txout, wtx.vout) {
@@ -668,7 +668,7 @@ CAmount GetAccountBalance(CWalletDB& walletdb, const string& strAccount, int nMi
     // Tally wallet transactions
     for (map<uint256, CWalletTx>::iterator it = pwalletMain->mapWallet.begin(); it != pwalletMain->mapWallet.end(); ++it) {
         const CWalletTx& wtx = (*it).second;
-        if (!IsFinalTx(wtx) || wtx.GetBlocksToMaturity() > 0 || wtx.GetDepthInMainChain() < 0)
+        if (!CheckFinalTx(wtx) || wtx.GetBlocksToMaturity() > 0 || wtx.GetDepthInMainChain() < 0)
             continue;
 
         CAmount nReceived, nSent, nFee;
@@ -742,7 +742,7 @@ UniValue getbalance(const UniValue& params, bool fHelp)
         CAmount nBalance = 0;
         for (map<uint256, CWalletTx>::iterator it = pwalletMain->mapWallet.begin(); it != pwalletMain->mapWallet.end(); ++it) {
             const CWalletTx& wtx = (*it).second;
-            if (!IsFinalTx(wtx) || wtx.GetBlocksToMaturity() > 0 || wtx.GetDepthInMainChain() < 0)
+            if (!CheckFinalTx(wtx) || wtx.GetBlocksToMaturity() > 0 || wtx.GetDepthInMainChain() < 0)
                 continue;
 
             CAmount allFee;
