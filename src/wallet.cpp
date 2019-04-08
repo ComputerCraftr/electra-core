@@ -1547,6 +1547,37 @@ bool CWalletTx::InMempool() const
     return false;
 }
 
+bool CWalletTx::IsTrusted() const
+{
+    // Quick answer in most cases
+    if (!CheckFinalTx(*this))
+        return false;
+    int nDepth = GetDepthInMainChain();
+    if (nDepth >= 1)
+        return true;
+    if (nDepth < 0)
+        return false;
+    if (!bSpendZeroConfChange || !IsFromMe(ISMINE_ALL)) // using wtx's cached debit
+        return false;
+
+    // Don't trust unconfirmed transactions from us unless they are in the mempool.
+    if (!InMempool())
+        return false;
+
+    // Trusted if all inputs are from us and are in the mempool:
+    BOOST_FOREACH(const CTxIn& txin, vin)
+    {
+        // Transactions not sent by us: not trusted
+        const CWalletTx* parent = pwallet->GetWalletTx(txin.prevout.hash);
+        if (parent == NULL)
+            return false;
+        const CTxOut& parentOut = parent->vout[txin.prevout.n];
+        if (pwallet->IsMine(parentOut) != ISMINE_SPENDABLE)
+            return false;
+    }
+    return true;
+}
+
 void CWalletTx::RelayWalletTransaction(std::string strCommand)
 {
     LOCK(cs_main);
