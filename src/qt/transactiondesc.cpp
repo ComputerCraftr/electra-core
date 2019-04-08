@@ -28,7 +28,8 @@ using namespace std;
 QString TransactionDesc::FormatTxStatus(const CWalletTx& wtx)
 {
     AssertLockHeld(cs_main);
-    if (!IsFinalTx(wtx, chainActive.Height() + 1)) {
+    if (!CheckFinalTx(wtx))
+    {
         if (wtx.nLockTime < LOCKTIME_THRESHOLD)
             return tr("Open for %n more block(s)", "", wtx.nLockTime - chainActive.Height());
         else

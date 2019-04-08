@@ -123,11 +123,6 @@ CBlockTemplate* CreateNewBlock(const CScript& scriptPubKeyIn, CWallet* pwallet, 
     else
         pblock->nVersion = CBlock::CURRENT_VERSION;
 
-    const int64_t nMedianTimePast = pindexPrev->GetMedianTimePast();
-    int64_t nLockTimeCutoff = (STANDARD_LOCKTIME_VERIFY_FLAGS & LOCKTIME_MEDIAN_TIME_PAST)
-                            ? nMedianTimePast
-                            : pblock->GetBlockTime();
-
     // Create coinbase tx
     CMutableTransaction txNew;
     txNew.vin.resize(1);
@@ -192,6 +187,11 @@ CBlockTemplate* CreateNewBlock(const CScript& scriptPubKeyIn, CWallet* pwallet, 
         CBlockIndex* pindexPrev = chainActive.Tip();
         const int nHeight = pindexPrev->nHeight + 1;
         CCoinsViewCache view(pcoinsTip);
+
+        const int64_t nMedianTimePast = pindexPrev->GetMedianTimePast();
+        int64_t nLockTimeCutoff = (STANDARD_LOCKTIME_VERIFY_FLAGS & LOCKTIME_MEDIAN_TIME_PAST)
+                                ? nMedianTimePast
+                                : pblock->GetBlockTime();
 
         // Priority order to process transactions
         list<COrphan> vOrphan; // list memory doesn't move
