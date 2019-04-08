@@ -2953,6 +2953,10 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
             return state.DoS(100, error("ConnectBlock(): zerocoin transactions are currently in maintenance mode"));
         }
 
+        if (pindex->nHeight < Params().Zerocoin_Block_V2_Start() && tx.ContainsZerocoins()) {
+            return state.DoS(100, error("ConnectBlock(): zerocoin is not yet active"));
+        }
+
         if (tx.IsZerocoinSpend()) {
             int nHeightTx = 0;
             uint256 txid = tx.GetHash();
