@@ -4376,7 +4376,6 @@ bool AcceptBlockHeader(const CBlockHeader& block, CValidationState& state, CBloc
             return state.DoS(100, error("%s: prev block height=%d hash=%s is invalid, unable to add block %s", __func__, pindexPrev->nHeight, block.hashPrevBlock.GetHex(), block.GetHash().GetHex()),
                              REJECT_INVALID, "bad-prevblk");
         }
-
     }
 
     if (!ContextualCheckBlockHeader(block, state, pindexPrev))
@@ -4427,7 +4426,7 @@ bool AcceptBlock(CBlock& block, CValidationState& state, CBlockIndex** ppindex, 
     if (block.GetHash() != Params().HashGenesisBlock()) {
         BlockMap::iterator mi = mapBlockIndex.find(block.hashPrevBlock);
         if (mi == mapBlockIndex.end())
-            return state.DoS(0, error("%s: prev block %s not found", __func__, block.hashPrevBlock.ToString().c_str()), 0, "bad-prevblk");
+            return state.DoS(10, error("%s: prev block %s not found", __func__, block.hashPrevBlock.ToString().c_str()), 0, "bad-prevblk");
         pindexPrev = (*mi).second;
         if (pindexPrev->nStatus & BLOCK_FAILED_MASK) {
             //If this "invalid" block is an exact match from the checkpoints, then reconsider it
@@ -4440,7 +4439,7 @@ bool AcceptBlock(CBlock& block, CValidationState& state, CBlockIndex** ppindex, 
                     return true;
                 }
             }
-            return state.DoS(100, error("%s: prev block %s is invalid, unable to add block %s", __func__, block.hashPrevBlock.GetHex(), block.GetHash().GetHex()),
+            return state.DoS(100, error("%s: prev block height=%d hash=%s is invalid, unable to add block %s", __func__, pindexPrev->nHeight, block.hashPrevBlock.GetHex(), block.GetHash().GetHex()),
                              REJECT_INVALID, "bad-prevblk");
         }
     }
@@ -4778,7 +4777,7 @@ bool ProcessNewBlock(CValidationState &state, CNode* pfrom, CBlock* pblock, bool
     if (!CheckBlockSignature(*pblock))
         return error("ProcessNewBlock(): bad proof-of-stake block signature");
 
-    if (!Params().HeadersFirstSyncingActive() && pblock->GetHash() != Params().HashGenesisBlock() && pfrom != NULL) {
+    if ((!Params().HeadersFirstSyncingActive() || pfrom->nVersion < SENDHEADERS_VERSION) && pblock->GetHash() != Params().HashGenesisBlock() && pfrom != NULL) {
         //if we get this far, check if the prev block is our prev block, if not then request sync and return false
         BlockMap::iterator mi = mapBlockIndex.find(pblock->hashPrevBlock);
         if (mi == mapBlockIndex.end()) {
@@ -5676,7 +5675,7 @@ void static ProcessGetData(CNode* pfrom)
                         vector<CInv> vInv;
                         vInv.push_back(CInv(MSG_BLOCK, chainActive.Tip()->GetBlockHash()));
                         pfrom->PushMessage("inv", vInv);
-                        pfrom->hashContinue = 0;
+                        pfrom->hashContinue.SetNull();
                     }
                 }
             } else if (inv.IsKnownType()) {
@@ -6588,7 +6587,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                         }
                         vGetData.push_back(CInv(MSG_BLOCK, pindex->GetBlockHash()));
                         MarkBlockAsInFlight(pfrom->GetId(), pindex->GetBlockHash(), pindex);
-                        LogPrint("net", "Requesting block %s from  peer=%d\n",
+                        LogPrint("net", "Requesting block %s from peer=%d\n",
                                 pindex->GetBlockHash().ToString(), pfrom->id);
                     }
                     if (vGetData.size() > 1) {
@@ -6617,18 +6616,18 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         if (!mapBlockIndex.count(block.hashPrevBlock)) {
             if (find(pfrom->vBlockRequested.begin(), pfrom->vBlockRequested.end(), hashBlock) != pfrom->vBlockRequested.end()) {
                 //we already asked for this block, so lets work backwards and ask for the previous block
-                pfrom->PushMessage("getblocks", chainActive.GetLocator(), block.hashPrevBlock);
+                pfrom->PushMessage((pfrom->nVersion >= SENDHEADERS_VERSION && Params().HeadersFirstSyncingActive()) ? "getheaders" : "getblocks", chainActive.GetLocator(), block.hashPrevBlock);
                 pfrom->vBlockRequested.push_back(block.hashPrevBlock);
             } else {
                 //ask to sync to this block
-                pfrom->PushMessage("getblocks", chainActive.GetLocator(), hashBlock);
+                pfrom->PushMessage((pfrom->nVersion >= SENDHEADERS_VERSION && Params().HeadersFirstSyncingActive()) ? "getheaders" : "getblocks", chainActive.GetLocator(), hashBlock);
                 pfrom->vBlockRequested.push_back(hashBlock);
             }
         } else {
             pfrom->AddInventoryKnown(inv);
 
             CValidationState state;
-            if (Params().HeadersFirstSyncingActive() || !mapBlockIndex.count(block.GetHash())) {
+            if ((pfrom->nVersion >= SENDHEADERS_VERSION && Params().HeadersFirstSyncingActive()) || !mapBlockIndex.count(block.GetHash())) {
                 // Process all blocks from whitelisted peers, even if not requested,
                 // unless we're still syncing with the network.
                 // Such an unrequested block may still be processed, subject to the
@@ -7163,7 +7162,8 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
         // Resend wallet transactions that haven't gotten in a block yet
         // Except during reindex, importing and IBD, when old wallet
         // transactions become unconfirmed and spams other nodes.
-        if (!fReindex && !fImporting && !IsInitialBlockDownload()) {
+        if (!fReindex && !fImporting && !IsInitialBlockDownload())
+        {
             GetMainSignals().Broadcast();
         }
 
@@ -7198,7 +7198,21 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
                         fRevertToInv = true;
                         break;
                     }
-                    assert(pBestIndex == NULL || pindex->pprev == pBestIndex);
+                    if (pBestIndex != NULL && pindex->pprev != pBestIndex) {
+                        // This means that the list of blocks to announce don't
+                        // connect to each other.
+                        // This shouldn't really be possible to hit during
+                        // regular operation (because reorgs should take us to
+                        // a chain that has some block not on the prior chain,
+                        // which should be caught by the prior check), but one
+                        // way this could happen is by using invalidateblock /
+                        // reconsiderblock repeatedly on the tip, causing it to
+                        // be added multiple times to vBlockHashesToAnnounce.
+                        // Robustly deal with this rare situation by reverting
+                        // to an inv.
+                        fRevertToInv = true;
+                        break;
+                    }
                     pBestIndex = pindex;
                     if (fFoundStartingHeader) {
                         // add this to the headers message
@@ -7218,6 +7232,22 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
                     }
                 }
             }
+            if (!fRevertToInv && !vHeaders.empty()) {
+                if (state.fPreferHeaders) {
+                    if (vHeaders.size() > 1) {
+                        LogPrint("net", "%s: %u headers, range (%s, %s), to peer=%d\n", __func__,
+                                vHeaders.size(),
+                                vHeaders.front().GetHash().ToString(),
+                                vHeaders.back().GetHash().ToString(), pto->id);
+                    } else {
+                        LogPrint("net", "%s: sending header %s to peer=%d\n", __func__,
+                                vHeaders.front().GetHash().ToString(), pto->id);
+                    }
+                    pto->PushMessage("headers", vHeaders);
+                    state.pindexBestHeaderSent = pBestIndex;
+                } else
+                    fRevertToInv = true;
+            }
             if (fRevertToInv) {
                 // If falling back to using an inv, just try to inv the tip.
                 // The last entry in vBlockHashesToAnnounce was our tip at some point
@@ -7236,27 +7266,13 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
                             hashToAnnounce.ToString(), chainActive.Tip()->GetBlockHash().ToString());
                     }
 
-                    // If the peer announced this block to us, don't inv it back.
-                    // (Since block announcements may not be via inv's, we can't solely rely on
-                    // setInventoryKnown to track this.)
+                    // If the peer's chain has this block, don't inv it back.
                     if (!PeerHasHeader(&state, pindex)) {
                         pto->PushInventory(CInv(MSG_BLOCK, hashToAnnounce));
                         LogPrint("net", "%s: sending inv peer=%d hash=%s\n", __func__,
                             pto->id, hashToAnnounce.ToString());
                     }
                 }
-            } else if (!vHeaders.empty()) {
-                if (vHeaders.size() > 1) {
-                    LogPrint("net", "%s: %u headers, range (%s, %s), to peer=%d\n", __func__,
-                            vHeaders.size(),
-                            vHeaders.front().GetHash().ToString(),
-                            vHeaders.back().GetHash().ToString(), pto->id);
-                } else {
-                    LogPrint("net", "%s: sending header %s to peer=%d\n", __func__,
-                            vHeaders.front().GetHash().ToString(), pto->id);
-                }
-                pto->PushMessage("headers", vHeaders);
-                state.pindexBestHeaderSent = pBestIndex;
             }
             pto->vBlockHashesToAnnounce.clear();
         }
