@@ -91,12 +91,8 @@ BOOST_GLOBAL_FIXTURE(TestingSetup);
 
 CTxMemPoolEntry TestMemPoolEntryHelper::FromTx(CMutableTransaction &tx, CTxMemPool *pool) {
     CTransaction txn(tx);
-    bool hasNoDependencies = pool ? pool->HasNoInputsOf(tx) : hadNoDependencies;
-    // Hack to assume either its completely dependent on other mempool txs or not at all
-    CAmount inChainValue = hasNoDependencies ? txn.GetValueOut() : 0;
 
-    return CTxMemPoolEntry(txn, nFee, nTime, dPriority, nHeight,
-                           hasNoDependencies, inChainValue, spendsCoinbase, sigOpCount, lp);
+    return CTxMemPoolEntry(txn, nFee, nTime, dPriority, nHeight, lp);
 }
 
 void Shutdown(void* parg)
