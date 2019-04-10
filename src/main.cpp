@@ -3060,6 +3060,25 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
         return state.DoS(100, error("ConnectBlock(): PoW period ended"),
             REJECT_INVALID, "PoW-ended");
 
+    if (/*block.GetHash() != Params().HashGenesisBlock() &&*/ !CheckWork(block, pindex->pprev))
+        return false;
+
+    bool isPoS = false;
+    uint256 hashProofOfStake = 0;
+    if (block.IsProofOfStake()) {
+        isPoS = true;
+        unique_ptr<CStakeInput> stake;
+
+        if (!CheckProofOfStake(block, hashProofOfStake, stake))
+            return state.DoS(100, error("%s: proof of stake check failed", __func__));
+
+        if (!stake)
+            return error("%s: null stake ptr", __func__);
+
+        if (stake->IsZECA() && !ContextualCheckZerocoinStake(pindex->pprev->nHeight, stake.get()))
+            return state.DoS(100, error("%s: staked zECA fails context checks", __func__));
+    }
+
     bool fScriptChecks = pindex->nHeight >= Checkpoints::GetTotalBlocksEstimate();
 
     // Do not allow blocks that contain transactions which 'overwrite' older transactions,
@@ -3308,6 +3327,9 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
     //IMPORTANT NOTE: Nothing before this point should actually store to disk (or even memory)
     if (fJustCheck)
         return true;
+
+    if (isPoS && !mapProofOfStake.count(block.GetHash())) // add to mapProofOfStake
+        mapProofOfStake.insert(make_pair(block.GetHash(), hashProofOfStake));
 
     // Write undo information to disk
     if (pindex->GetUndoPos().IsNull() || !pindex->IsValid(BLOCK_VALID_SCRIPTS))
