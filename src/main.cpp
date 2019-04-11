@@ -66,7 +66,6 @@ using namespace libzerocoin;
 CCriticalSection cs_main;
 
 BlockMap mapBlockIndex;
-map<uint256, uint256> mapProofOfStake;
 set<pair<COutPoint, unsigned int> > setStakeSeen;
 map<unsigned int, unsigned int> mapHashedBlocks;
 CChain chainActive;
@@ -3025,6 +3024,31 @@ bool UpdateZECASupply(const CBlock& block, CBlockIndex* pindex, bool fJustCheck)
     return true;
 }
 
+bool ContextualCheckZerocoinStake(int nHeight, CStakeInput* stake)
+{
+    if (nHeight < Params().Zerocoin_Block_V2_Start())
+        return error("%s: zECA stake block is less than allowed start height", __func__);
+
+    if (CZEcaStake* zECA = dynamic_cast<CZEcaStake*>(stake)) {
+        CBlockIndex* pindexFrom = zECA->GetIndexFrom();
+        if (!pindexFrom)
+            return error("%s: failed to get index associated with zECA stake checksum", __func__);
+
+        if (chainActive.Height() - pindexFrom->nHeight < Params().Zerocoin_RequiredStakeDepth())
+            return error("%s: zECA stake does not have required confirmation depth. Current height %d, stakeInput height %d.", __func__, chainActive.Height(), pindexFrom->nHeight);
+
+        //The checksum needs to be the exact checksum from Params().Zerocoin_RequiredStakeDepth() blocks ago
+        uint256 nCheckpointDepth = chainActive[nHeight - Params().Zerocoin_RequiredStakeDepth()]->nAccumulatorCheckpoint;
+        uint32_t nChecksumDepth = ParseChecksum(nCheckpointDepth, libzerocoin::AmountToZerocoinDenomination(zECA->GetValue()));
+        if (nChecksumDepth != zECA->GetChecksum())
+            return error("%s: accumulator checksum is different than the block %d blocks earlier. stake=%d block%d=%d", __func__, Params().Zerocoin_RequiredStakeDepth(), zECA->GetChecksum(), Params().Zerocoin_RequiredStakeDepth(), nChecksumDepth);
+    } else {
+        return error("%s: dynamic_cast of stake ptr failed", __func__);
+    }
+
+    return true;
+}
+
 static int64_t nTimeVerify = 0;
 static int64_t nTimeConnect = 0;
 static int64_t nTimeIndex = 0;
@@ -3060,13 +3084,14 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
         return state.DoS(100, error("ConnectBlock(): PoW period ended"),
             REJECT_INVALID, "PoW-ended");
 
+    if (!CheckBlockSignature(block))
+        return error("%s: bad proof-of-stake block signature", __func__);
+
     if (/*block.GetHash() != Params().HashGenesisBlock() &&*/ !CheckWork(block, pindex->pprev))
         return false;
 
-    bool isPoS = false;
     uint256 hashProofOfStake = 0;
     if (block.IsProofOfStake()) {
-        isPoS = true;
         unique_ptr<CStakeInput> stake;
 
         if (!CheckProofOfStake(block, hashProofOfStake, stake))
@@ -3122,6 +3147,8 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
     unsigned int nMaxBlockSigOps = MAX_BLOCK_SIGOPS_CURRENT;
     vector<uint256> vSpendsInBlock;
     uint256 hashBlock = block.GetHash();
+    int nMints = 0;
+    int nSpends = 0;
     for (unsigned int i = 0; i < block.vtx.size(); i++) {
         const CTransaction& tx = block.vtx[i];
 
@@ -3156,6 +3183,7 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
             for (const CTxIn& txIn : tx.vin) {
                 if (!txIn.scriptSig.IsZerocoinSpend())
                     continue;
+                nSpends++;
                 CoinSpend spend = TxInToZerocoinSpend(txIn);
                 nValueIn += spend.getDenomination() * COIN;
 
@@ -3171,6 +3199,7 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
                     if (!out.IsZerocoinMint())
                         continue;
 
+                    nMints++;
                     PublicCoin coin(Params().Zerocoin_Params(false));
                     if (!TxOutToPublicCoin(out, coin, state))
                         return state.DoS(100, error("%s: failed final check of zerocoinmint for tx %s", __func__, tx.GetHash().GetHex()));
@@ -3213,6 +3242,7 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
                     if (!out.IsZerocoinMint())
                         continue;
 
+                    nMints++;
                     PublicCoin coin(Params().Zerocoin_Params(false));
                     if (!TxOutToPublicCoin(out, coin, state))
                         return state.DoS(100, error("%s: failed final check of zerocoinmint for tx %s", __func__, tx.GetHash().GetHex()));
@@ -3251,6 +3281,8 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
         vPos.push_back(std::make_pair(tx.GetHash(), pos));
         pos.nTxOffset += ::GetSerializeSize(tx, SER_DISK, CLIENT_VERSION);
     }
+    if (nMints || nSpends)
+        LogPrintf("%s: block %s contains %d zECA mints and %d zECA spends\n", __func__, hashBlock.GetHex(), nMints, nSpends);
 
     //A one-time event where money supply counts were off and recalculated on a certain block.
     if (pindex->nHeight == Params().Zerocoin_Block_RecalculateAccumulators() + 1) {
@@ -3262,7 +3294,7 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
     //Track zECA money supply in the block index
     if (!UpdateZECASupply(block, pindex, fJustCheck))
         return state.DoS(100, error("%s: Failed to calculate new zECA supply for block=%s height=%d", __func__,
-                                    block.GetHash().GetHex(), pindex->nHeight), REJECT_INVALID);
+                                    hashBlock.GetHex(), pindex->nHeight), REJECT_INVALID);
 
     // track money supply and mint amount info
     CAmount nMoneySupplyPrev = pindex->pprev ? pindex->pprev->nMoneySupply : 0;
@@ -3317,7 +3349,7 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
     AccumulatorMap mapAccumulators(Params().Zerocoin_Params(pindex->nHeight < Params().Zerocoin_Block_V2_Start()));
     if (!ValidateAccumulatorCheckpoint(block, pindex, mapAccumulators))
         return state.DoS(100, error("%s: Failed to validate accumulator checkpoint for block=%s height=%d", __func__,
-                                    block.GetHash().GetHex(), pindex->nHeight), REJECT_INVALID, "bad-acc-checkpoint");
+                                    hashBlock.GetHex(), pindex->nHeight), REJECT_INVALID, "bad-acc-checkpoint");
 
     if (!control.Wait())
         return state.DoS(100, error("%s: CheckQueue failed", __func__), REJECT_INVALID, "block-validation-failed");
@@ -3327,9 +3359,6 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
     //IMPORTANT NOTE: Nothing before this point should actually store to disk (or even memory)
     if (fJustCheck)
         return true;
-
-    if (isPoS && !mapProofOfStake.count(block.GetHash())) // add to mapProofOfStake
-        mapProofOfStake.insert(make_pair(block.GetHash(), hashProofOfStake));
 
     // Write undo information to disk
     if (pindex->GetUndoPos().IsNull() || !pindex->IsValid(BLOCK_VALID_SCRIPTS))
@@ -4066,13 +4095,6 @@ CBlockIndex* AddToBlockIndex(const CBlockHeader& block)
         if (!pindexNew->SetStakeEntropyBit(pindexNew->GetStakeEntropyBit()))
             LogPrintf("AddToBlockIndex(): SetStakeEntropyBit() failed \n");
 
-        // ppcoin: record proof-of-stake hash value
-        if (pindexNew->IsProofOfStake()) {
-            if (!mapProofOfStake.count(hash))
-                LogPrintf("AddToBlockIndex(): hashProofOfStake not found in map \n");
-            pindexNew->hashProofOfStake = mapProofOfStake[hash];
-        }
-
         // ppcoin: compute stake modifier
         uint64_t nStakeModifier = 0;
         bool fGeneratedStakeModifier = false;
@@ -4387,7 +4409,7 @@ bool CheckBlock(const CBlock& block, CValidationState& state, bool fCheckPOW, bo
     vector<CBigNum> vBlockSerials;
     for (const CTransaction& tx : block.vtx) {
         if (!CheckTransaction(tx, fZerocoinActive, nHeight >= Params().Zerocoin_Block_EnforceSerialRange(), state))
-            return error("CheckBlock(): CheckTransaction failed");
+            return error("CheckBlock(): CheckTransaction of %s failed with %s", tx.GetHash().ToString(), state.GetRejectReason());
 
         // double check that there are no double spent zECA spends in this block
         if (tx.IsZerocoinSpend()) {
@@ -4580,31 +4602,6 @@ bool AcceptBlockHeader(const CBlockHeader& block, CValidationState& state, CBloc
     return true;
 }
 
-bool ContextualCheckZerocoinStake(int nHeight, CStakeInput* stake)
-{
-    if (nHeight < Params().Zerocoin_Block_V2_Start())
-        return error("%s: zECA stake block is less than allowed start height", __func__);
-
-    if (CZEcaStake* zECA = dynamic_cast<CZEcaStake*>(stake)) {
-        CBlockIndex* pindexFrom = zECA->GetIndexFrom();
-        if (!pindexFrom)
-            return error("%s: failed to get index associated with zECA stake checksum", __func__);
-
-        if (chainActive.Height() - pindexFrom->nHeight < Params().Zerocoin_RequiredStakeDepth())
-            return error("%s: zECA stake does not have required confirmation depth. Current height %d, stakeInput height %d.", __func__, chainActive.Height(), pindexFrom->nHeight);
-
-        //The checksum needs to be the exact checksum from 200 blocks ago
-        uint256 nCheckpoint200 = chainActive[nHeight - Params().Zerocoin_RequiredStakeDepth()]->nAccumulatorCheckpoint;
-        uint32_t nChecksum200 = ParseChecksum(nCheckpoint200, libzerocoin::AmountToZerocoinDenomination(zECA->GetValue()));
-        if (nChecksum200 != zECA->GetChecksum())
-            return error("%s: accumulator checksum is different than the block 200 blocks previous. stake=%d block200=%d", __func__, zECA->GetChecksum(), nChecksum200);
-    } else {
-        return error("%s: dynamic_cast of stake ptr failed", __func__);
-    }
-
-    return true;
-}
-
 bool AcceptBlock(CBlock& block, CValidationState& state, CBlockIndex** ppindex, bool fRequested, CDiskBlockPos* dbp, bool fAlreadyCheckedBlock)
 {
     AssertLockHeld(cs_main);
@@ -4726,40 +4723,11 @@ void CBlockIndex::BuildSkip()
         pskip = pprev->GetAncestor(GetSkipHeight(nHeight));
 }
 
-bool ProcessNewBlock(CValidationState &state, CNode* pfrom, CBlock* pblock, bool fForceProcessing, CDiskBlockPos *dbp)
+bool ProcessNewBlock(CValidationState& state, CNode* pfrom, CBlock* pblock, bool fForceProcessing, CDiskBlockPos* dbp)
 {
     // Preliminary checks
     int64_t nStartTime = GetTimeMillis();
     bool checked = CheckBlock(*pblock, state);
-
-    int nMints = 0;
-    int nSpends = 0;
-    for (const CTransaction& tx : pblock->vtx) {
-        if (tx.ContainsZerocoins()) {
-            for (const CTxIn& in : tx.vin) {
-                if (in.scriptSig.IsZerocoinSpend())
-                    nSpends++;
-            }
-            for (const CTxOut& out : tx.vout) {
-                if (out.IsZerocoinMint())
-                    nMints++;
-            }
-        }
-    }
-    if (nMints || nSpends)
-        LogPrintf("%s: block contains %d zECA mints and %d zECA spends\n", __func__, nMints, nSpends);
-
-    if (!CheckBlockSignature(*pblock))
-        return error("ProcessNewBlock(): bad proof-of-stake block signature");
-
-    if (pblock->GetHash() != Params().HashGenesisBlock() && pfrom != NULL && (!Params().HeadersFirstSyncingActive() || pfrom->nVersion < SENDHEADERS_VERSION)) {
-        //if we get this far, check if the prev block is our prev block, if not then request sync and return false
-        BlockMap::iterator mi = mapBlockIndex.find(pblock->hashPrevBlock);
-        if (mi == mapBlockIndex.end()) {
-            pfrom->PushMessage("getblocks", chainActive.GetLocator(), uint256(0));
-            return false;
-        }
-    }
 
     {
         LOCK(cs_main);
@@ -4771,7 +4739,7 @@ bool ProcessNewBlock(CValidationState &state, CNode* pfrom, CBlock* pblock, bool
 
         // Store to disk
         CBlockIndex *pindex = NULL;
-        bool ret = AcceptBlock(*pblock, state, &pindex, dbp, checked);
+        bool ret = AcceptBlock(*pblock, state, &pindex, fRequested, dbp, checked);
         if (pindex && pfrom) {
             mapBlockSource[pindex->GetBlockHash()] = pfrom->GetId();
         }
@@ -6583,47 +6551,31 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
     {
         CBlock block;
         vRecv >> block;
-        uint256 hashBlock = block.GetHash();
-        CInv inv(MSG_BLOCK, hashBlock);
+
+        CInv inv(MSG_BLOCK, block.GetHash());
         LogPrint("net", "received block %s peer=%d\n", inv.hash.ToString(), pfrom->id);
 
-        //sometimes we will be sent their most recent block and its not the one we want, in that case tell where we are
-        if (!mapBlockIndex.count(block.hashPrevBlock)) {
-            if (find(pfrom->vBlockRequested.begin(), pfrom->vBlockRequested.end(), hashBlock) != pfrom->vBlockRequested.end()) {
-                //we already asked for this block, so lets work backwards and ask for the previous block
-                pfrom->PushMessage((pfrom->nVersion >= SENDHEADERS_VERSION && Params().HeadersFirstSyncingActive()) ? "getheaders" : "getblocks", chainActive.GetLocator(), block.hashPrevBlock);
-                pfrom->vBlockRequested.push_back(block.hashPrevBlock);
-            } else {
-                //ask to sync to this block
-                pfrom->PushMessage((pfrom->nVersion >= SENDHEADERS_VERSION && Params().HeadersFirstSyncingActive()) ? "getheaders" : "getblocks", chainActive.GetLocator(), hashBlock);
-                pfrom->vBlockRequested.push_back(hashBlock);
-            }
-        } else {
-            pfrom->AddInventoryKnown(inv);
+        pfrom->AddInventoryKnown(inv);
 
-            CValidationState state;
-            if (!mapBlockIndex.count(hashBlock) || !(mapBlockIndex.at(hashBlock)->nStatus & BLOCK_HAVE_DATA)) {
-                // Process all blocks from whitelisted peers, even if not requested,
-                // unless we're still syncing with the network.
-                // Such an unrequested block may still be processed, subject to the
-                // conditions in AcceptBlock().
-                bool forceProcessing = pfrom->fWhitelisted && !IsInitialBlockDownload();
-                ProcessNewBlock(state, pfrom, &block, forceProcessing, NULL);
-                int nDoS;
-                if (state.IsInvalid(nDoS)) {
-                    pfrom->PushMessage("reject", strCommand, state.GetRejectCode(),
-                                       state.GetRejectReason().substr(0, MAX_REJECT_MESSAGE_LENGTH), inv.hash);
-                    if (nDoS > 0) {
-                        TRY_LOCK(cs_main, lockMain);
-                        if(lockMain) Misbehaving(pfrom->GetId(), nDoS);
-                    }
-                }
-                //disconnect this node if its old protocol version
-                pfrom->DisconnectOldProtocol(ActiveProtocol(), strCommand);
-            } else {
-                LogPrint("net", "%s: Already processed block %s, skipping ProcessNewBlock()\n", __func__, hashBlock.GetHex());
+        CValidationState state;
+        // Process all blocks from whitelisted peers, even if not requested,
+        // unless we're still syncing with the network.
+        // Such an unrequested block may still be processed, subject to the
+        // conditions in AcceptBlock().
+        bool forceProcessing = pfrom->fWhitelisted && !IsInitialBlockDownload();
+        ProcessNewBlock(state, pfrom, &block, forceProcessing, NULL);
+        int nDoS;
+        if (state.IsInvalid(nDoS)) {
+            pfrom->PushMessage("reject", strCommand, (unsigned char)state.GetRejectCode(),
+                               state.GetRejectReason().substr(0, MAX_REJECT_MESSAGE_LENGTH), inv.hash);
+            if (nDoS > 0) {
+                LOCK(cs_main);
+                Misbehaving(pfrom->GetId(), nDoS);
             }
         }
+
+        //disconnect this node if it has an old protocol version
+        pfrom->DisconnectOldProtocol(ActiveProtocol(), strCommand);
     }
 
 
