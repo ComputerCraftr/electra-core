@@ -22,7 +22,7 @@ static const int GETHEADERS_VERSION = 70077;
 
 //! disconnect from peers older than this proto version
 static const int MIN_PEER_PROTO_VERSION_AFTER_WALLET_UPGRADE = 70915;
-static const int MIN_PEER_PROTO_VERSION_BEFORE_ENFORCEMENT = 70915;
+static const int MIN_PEER_PROTO_VERSION_BEFORE_ENFORCEMENT = 70914;
 static const int MIN_PEER_PROTO_VERSION_AFTER_ENFORCEMENT = PROTOCOL_VERSION;
 
 //! masternodes older than this proto version use old strMessage format for mnannounce
