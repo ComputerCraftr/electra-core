@@ -6387,43 +6387,26 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
     {
         CBlock block;
         vRecv >> block;
-        uint256 hashBlock = block.GetHash();
-        CInv inv(MSG_BLOCK, hashBlock);
+
+        CInv inv(MSG_BLOCK, block.GetHash());
         LogPrint("net", "received block %s peer=%d\n", inv.hash.ToString(), pfrom->id);
 
-        //sometimes we will be sent their most recent block and its not the one we want, in that case tell where we are
-        if (!mapBlockIndex.count(block.hashPrevBlock)) {
-            if (find(pfrom->vBlockRequested.begin(), pfrom->vBlockRequested.end(), hashBlock) != pfrom->vBlockRequested.end()) {
-                //we already asked for this block, so lets work backwards and ask for the previous block
-                pfrom->PushMessage((pfrom->nVersion >= SENDHEADERS_VERSION && Params().HeadersFirstSyncingActive()) ? "getheaders" : "getblocks", chainActive.GetLocator(), block.hashPrevBlock);
-                pfrom->vBlockRequested.push_back(block.hashPrevBlock);
-            } else {
-                //ask to sync to this block
-                pfrom->PushMessage((pfrom->nVersion >= SENDHEADERS_VERSION && Params().HeadersFirstSyncingActive()) ? "getheaders" : "getblocks", chainActive.GetLocator(), hashBlock);
-                pfrom->vBlockRequested.push_back(hashBlock);
-            }
-        } else {
-            pfrom->AddInventoryKnown(inv);
+        pfrom->AddInventoryKnown(inv);
 
-            CValidationState state;
-            if (!mapBlockIndex.count(hashBlock) || !(mapBlockIndex.at(hashBlock)->nStatus & BLOCK_HAVE_DATA)) {
-                // Process all blocks from whitelisted peers, even if not requested,
-                // unless we're still syncing with the network.
-                // Such an unrequested block may still be processed, subject to the
-                // conditions in AcceptBlock().
-                bool forceProcessing = pfrom->fWhitelisted && !IsInitialBlockDownload();
-                ProcessNewBlock(state, pfrom, &block, forceProcessing, NULL);
-                int nDoS;
-                if (state.IsInvalid(nDoS)) {
-                    pfrom->PushMessage("reject", strCommand, (unsigned char)state.GetRejectCode(),
-                                       state.GetRejectReason().substr(0, MAX_REJECT_MESSAGE_LENGTH), inv.hash);
-                    if (nDoS > 0) {
-                        LOCK(cs_main);
-                        Misbehaving(pfrom->GetId(), nDoS);
-                    }
-                }
-            } else {
-                LogPrint("net", "%s: Already processed block %s, skipping ProcessNewBlock()\n", __func__, hashBlock.GetHex());
+        CValidationState state;
+        // Process all blocks from whitelisted peers, even if not requested,
+        // unless we're still syncing with the network.
+        // Such an unrequested block may still be processed, subject to the
+        // conditions in AcceptBlock().
+        bool forceProcessing = pfrom->fWhitelisted && !IsInitialBlockDownload();
+        ProcessNewBlock(state, pfrom, &block, forceProcessing, NULL);
+        int nDoS;
+        if (state.IsInvalid(nDoS)) {
+            pfrom->PushMessage("reject", strCommand, (unsigned char)state.GetRejectCode(),
+                               state.GetRejectReason().substr(0, MAX_REJECT_MESSAGE_LENGTH), inv.hash);
+            if (nDoS > 0) {
+                LOCK(cs_main);
+                Misbehaving(pfrom->GetId(), nDoS);
             }
         }
 
