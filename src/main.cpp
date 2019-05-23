@@ -5653,7 +5653,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         if (pfrom->DisconnectOldProtocol(ActiveProtocol(), strCommand))
             return false;
 
-        // Instantly ban old peers once we are at the upgrade block
+        // Disconnect from old peers once we are at the upgrade block
         if (pfrom->nVersion < MIN_PEER_PROTO_VERSION_AFTER_WALLET_UPGRADE && (chainActive.Height() + 1 >= Params().WALLET_UPGRADE_BLOCK() || Params().NetworkID() != CBaseChainParams::MAIN)) {
             LogPrintf("peer=%d using obsolete version %i; disconnecting\n", pfrom->id, pfrom->nVersion);
             pfrom->PushMessage("reject", strCommand, REJECT_OBSOLETE,

@@ -54,8 +54,8 @@ unsigned int GetNextWorkRequired(const CBlockIndex* pindexLast, const CBlockHead
         if (nActualSpacing < 0)
             nActualSpacing = 1;
 
-        // ecacoin: target change every block
-        // ecacoin: retarget with exponential moving toward target spacing
+        // ppcoin: target change every block
+        // ppcoin: retarget with exponential moving toward target spacing
         uint256 bnNew;
         bnNew.SetCompact(pindexPrev->nBits);
 
