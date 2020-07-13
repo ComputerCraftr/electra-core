@@ -71,7 +71,6 @@ src/qt/test/moc*.cpp
 *.trs
 *.dmg
 
-*.json.h
 *.raw.h
 
 #libtool object files
@@ -88,6 +87,8 @@ Electra-Qt.app
 Makefile.test
 electra-qt_test
 src/test/buildenv.py
+src/test/data/*.json.h
+test/config.ini
 
 # Resources cpp
 qrc_*.cpp
@@ -110,13 +111,13 @@ coverage_percent.txt
 linux-coverage-build
 linux-build
 win32-build
-test/config.ini
 qa/pull-tester/run-bitcoind-for-test.sh
 qa/pull-tester/tests-config.sh
 qa/pull-tester/cache/*
 qa/pull-tester/test.*/*
 
 !src/leveldb*/Makefile
+!depends/Makefile
 
 .cproject
 .project
@@ -124,5 +125,4 @@ qa/pull-tester/test.*/*
 /nbproject/
 
 .idea
-CMakeLists.txt
 cmake-build-debug
